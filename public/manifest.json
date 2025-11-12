@@ -1,6 +1,6 @@
 {
-  "name": "Extension name",
-  "description": "Extension description",
+  "name": "Improv - AI Userscript Creator",
+  "description": "Create custom userscripts for any website using AI. Fix bugs, add features, and customize pages with LLM assistance.",
   "version": "0.1.0",
   "manifest_version": 3,
   "icons": {
@@ -10,18 +10,30 @@
     "128": "icons/128.png"
   },
   "action": {
-    "default_title": "Extension action title",
-    "default_popup": "popup/index.html"
+    "default_title": "Open Improv Side Panel"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
   },
   "options_page": "options/index.html",
   "background": {
     "service_worker": "background.js"
   },
-  "permissions": [],
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["contentScript.js"]
+      "js": ["contentScript.js"],
+      "run_at": "document_start"
     }
   ]
 }

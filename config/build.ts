@@ -31,8 +31,7 @@ await Bun.build({
   entrypoints: resolveEntryPoints([
     ...scripts,
     service_worker,
-    "options/index.tsx",
-    "popup/index.tsx",
+    "sidepanel/index.tsx",
   ]),
   outdir,
 });

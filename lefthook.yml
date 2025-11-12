@@ -1,0 +1,12 @@
+pre-push:
+  commands:
+    build:
+      run: bun run build
+
+pre-commit:
+  parallel: true
+  commands:
+    lint_format_save:
+      glob: "*.{js,ts,json}"
+      run: npx @biomejs/biome check --write --no-errors-on-unmatched --files-ignore-unknown=true --colors=off {staged_files}
+      stage_fixed: true

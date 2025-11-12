@@ -193,11 +193,11 @@ Current page URL: ${pageData?.url || chat.initialUrl}`,
             type: "text",
             text: `User request: ${userMessage}
 
-Page HTML (truncated):
-${pageData.html.slice(0, 10000)}
+Page HTML (high-entropy strings like data URLs have been truncated):
+${pageData.html.slice(0, 200000)}
 
 Console logs:
-${pageData.consoleLog.slice(0, 2000)}`,
+${pageData.consoleLog.slice(0, 20000)}`,
           },
           {
             type: "image_url",

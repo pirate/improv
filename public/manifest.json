@@ -13,7 +13,7 @@
     "default_title": "Open Improv Side Panel"
   },
   "side_panel": {
-    "default_path": "sidepanel.html"
+    "default_path": "sidepanel/index.html"
   },
   "background": {
     "service_worker": "background.js"

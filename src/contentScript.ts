@@ -36,65 +36,21 @@ const truncateHighEntropyStrings = (html: string): string => {
 
 // Message handler
 chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
+	if (message.type === "PING") {
+		sendResponse({ type: "PONG" });
+		return true;
+	}
+
+	// EXECUTE_JS is now handled by background.js using chrome.scripting.executeScript
+	// This bypasses CSP restrictions
 	if (message.type === "EXECUTE_JS") {
-		const tempConsoleLogs: string[] = [];
-		const tempOriginalConsole = {
-			log: console.log,
-			error: console.error,
-			warn: console.warn,
-			info: console.info,
-		};
-
-		// Temporarily override console to capture this execution's output
-		console.log = (...args: unknown[]) => {
-			tempOriginalConsole.log(...args);
-			tempConsoleLogs.push(`[LOG] ${args.map(a => String(a)).join(" ")}`);
-		};
-		console.error = (...args: unknown[]) => {
-			tempOriginalConsole.error(...args);
-			tempConsoleLogs.push(`[ERROR] ${args.map(a => String(a)).join(" ")}`);
-		};
-		console.warn = (...args: unknown[]) => {
-			tempOriginalConsole.warn(...args);
-			tempConsoleLogs.push(`[WARN] ${args.map(a => String(a)).join(" ")}`);
-		};
-		console.info = (...args: unknown[]) => {
-			tempOriginalConsole.info(...args);
-			tempConsoleLogs.push(`[INFO] ${args.map(a => String(a)).join(" ")}`);
-		};
-
-		try {
-			// Execute the code
-			const result = eval(message.code);
-
-			// Restore console
-			console.log = tempOriginalConsole.log;
-			console.error = tempOriginalConsole.error;
-			console.warn = tempOriginalConsole.warn;
-			console.info = tempOriginalConsole.info;
-
-			const response: ExecuteJsResponse = {
-				type: "EXECUTE_JS_RESPONSE",
-				requestId: message.requestId,
-				result: tempConsoleLogs.join("\n") + (result !== undefined ? `\nReturn value: ${String(result)}` : ""),
-			};
-			sendResponse(response);
-		} catch (error) {
-			// Restore console
-			console.log = tempOriginalConsole.log;
-			console.error = tempOriginalConsole.error;
-			console.warn = tempOriginalConsole.warn;
-			console.info = tempOriginalConsole.info;
-
-			const response: ExecuteJsResponse = {
-				type: "EXECUTE_JS_RESPONSE",
-				requestId: message.requestId,
-				result: tempConsoleLogs.join("\n"),
-				error: error instanceof Error ? error.message : String(error),
-			};
-			sendResponse(response);
-		}
-		return true; // Keep the message channel open for async response
+		sendResponse({
+			type: "EXECUTE_JS_RESPONSE",
+			requestId: message.requestId,
+			result: "",
+			error: "EXECUTE_JS should be handled by background script",
+		});
+		return true;
 	}
 
 	if (message.type === "CAPTURE_PAGE_DATA") {
@@ -115,36 +71,14 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
 		return true;
 	}
 
+	// INJECT_USERSCRIPT is now handled by background.js using chrome.scripting.executeScript
+	// This bypasses CSP restrictions
 	if (message.type === "INJECT_USERSCRIPT") {
-		try {
-			eval(message.script);
-		} catch (error) {
-			console.error("Userscript execution error:", error);
-		}
+		// No-op, background script handles this
+		return true;
 	}
 });
 
-// Load and execute matching userscripts on page load
-(async () => {
-	try {
-		const result = await chrome.storage.local.get("userscripts");
-		const userscripts = result.userscripts || [];
-		const currentUrl = window.location.href;
-
-		for (const script of userscripts) {
-			if (script.enabled) {
-				try {
-					const regex = new RegExp(script.matchUrls);
-					if (regex.test(currentUrl)) {
-						console.log(`[Improv] Executing userscript: ${script.name}`);
-						eval(script.jsScript);
-					}
-				} catch (error) {
-					console.error(`[Improv] Error in userscript ${script.name}:`, error);
-				}
-			}
-		}
-	} catch (error) {
-		console.error("[Improv] Error loading userscripts:", error);
-	}
-})();
+// Userscript auto-execution is now handled by background.js
+// using chrome.webNavigation.onCompleted and chrome.scripting.executeScript
+// This bypasses CSP restrictions

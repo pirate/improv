@@ -3,6 +3,7 @@ export interface Userscript {
   name: string;
   matchUrls: string; // Regex pattern as string
   jsScript: string;
+  chatHistoryId: string | null; // null if created manually, otherwise references the chat it came from
   createdAt: number;
   updatedAt: number;
   enabled: boolean;
@@ -33,7 +34,7 @@ export interface ToolResult {
 
 export interface ChatHistory {
   id: string;
-  userscriptId: string | null; // null if not yet saved as userscript
+  domain: string; // Domain of the page (e.g., "example.com")
   apiUrl: string;
   modelName: string;
   messages: ChatMessage[];
@@ -64,6 +65,7 @@ export interface CapturePageDataRequest {
   type: "CAPTURE_PAGE_DATA";
   tabId: number;
   requestId: string;
+  includeScreenshot?: boolean;
 }
 
 export interface CapturePageDataResponse {

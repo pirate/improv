@@ -129,3 +129,13 @@ export const truncateHighEntropyStrings = (html: string): string => {
 	html = html.replace(/([A-Za-z0-9+/]{500,}={0,2})/g, "[...truncated...]");
 	return html;
 };
+
+// Extract domain from URL
+export const getDomainFromUrl = (url: string): string => {
+	try {
+		const urlObj = new URL(url);
+		return urlObj.hostname;
+	} catch {
+		return "";
+	}
+};

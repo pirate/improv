@@ -26,15 +26,31 @@ const ext = {
   css: ".css",
 };
 
+// Build all extension scripts with IIFE format (no exports)
 await Bun.build({
   target: "browser",
+  format: "iife",
   entrypoints: resolveEntryPoints([
     ...scripts,
     service_worker,
+  ]),
+  outdir,
+});
+
+// Content script with IIFE format auto-executes, no need to modify it
+
+// Build sidepanel with default format (ESM)
+await Bun.build({
+  target: "browser",
+  entrypoints: resolveEntryPoints([
     "sidepanel/index.tsx",
   ]),
   outdir,
 });
+
+// Move sidepanel index.js into sidepanel folder
+await $`mkdir -p ${outdir}/sidepanel`;
+await $`mv ${outdir}/index.js ${outdir}/sidepanel/index.js`;
 
 const glob = new Glob("**");
 
@@ -52,6 +68,8 @@ for await (const filename of glob.scan(publicFolder)) {
   if (filename.endsWith(ext.html)) {
     const fileFolder = filename.replace(ext.html, "");
 
+    // Create the folder if it doesn't exist
+    await $`mkdir -p ${outdir}/${fileFolder}`;
     // rename files to index.html since it's being copied into a folder that share its original name
     await $`cp ${file.name} ${outdir}/${fileFolder}/index.html`;
     // copy the css file into the folder

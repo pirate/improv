@@ -2,10 +2,10 @@
 
 A Chrome extension that lets you create custom mods and patches for any live website using AI assistance.
 
-<img width="2013" height="1203" alt="Screenshot 2025-11-18 at 11 01 49 AM" src="https://github.com/user-attachments/assets/529de6fc-2c56-4649-8915-46bd77192492" />
-<img width="590" height="1206" alt="Screenshot 2025-11-18 at 11 02 02 AM" src="https://github.com/user-attachments/assets/1a9dc541-dcda-473c-869d-7e7428cab0de" />
-<img width="591" height="1209" alt="Screenshot 2025-11-18 at 11 02 18 AM" src="https://github.com/user-attachments/assets/68bb10c6-3a11-4130-bb80-16b84051d924" />
-<img width="591" height="1205" alt="Screenshot 2025-11-18 at 11 02 59 AM" src="https://github.com/user-attachments/assets/8990eb27-b3f8-4798-ba6b-591751ea7291" />
+<img width="2013" height="1203" alt="Screenshot 2025-11-18 at 11 01 49 AM" src="https://github.com/user-attachments/assets/529de6fc-2c56-4649-8915-46bd77192492" /><br/>
+<img width="32%" src="https://github.com/user-attachments/assets/1a9dc541-dcda-473c-869d-7e7428cab0de" />
+<img width="32%" src="https://github.com/user-attachments/assets/68bb10c6-3a11-4130-bb80-16b84051d924" />
+<img width="32%" src="https://github.com/user-attachments/assets/8990eb27-b3f8-4798-ba6b-591751ea7291" />
 
 ## Features
 

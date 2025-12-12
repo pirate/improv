@@ -1,4 +1,146 @@
-import type { Message, ExecuteJsRequest, CapturePageDataRequest, InjectUserscriptRequest, ExecuteJsResponse, CapturePageDataResponse } from "./types";
+import type {
+	CapturePageDataRequest,
+	CapturePageDataResponse,
+	ExecuteJsRequest,
+	ExecuteJsResponse,
+	GrabModeActivateRequest,
+	GrabModeDeactivateRequest,
+	InjectUserscriptRequest,
+	Message,
+} from "./types";
+
+// ============================================================================
+// CSP Nonce Detection
+// ============================================================================
+
+// Store nonces per tab/frame - key is `${tabId}:${frameId}`
+const nonceCache: Map<string, string> = new Map();
+
+// Regex to extract nonce from CSP header
+const CSP_NONCE_RE = /'nonce-([A-Za-z0-9+/=_-]+)'/;
+
+/**
+ * Extract nonce from Content-Security-Policy header value
+ */
+function extractNonceFromCsp(cspValue: string): string | null {
+	const match = cspValue.match(CSP_NONCE_RE);
+	return match ? match[1] : null;
+}
+
+/**
+ * Listen for response headers to extract CSP nonces
+ */
+chrome.webRequest.onHeadersReceived.addListener(
+	(details) => {
+		const { tabId, frameId, responseHeaders } = details;
+		if (!responseHeaders || tabId < 0) return;
+
+		// Look for Content-Security-Policy header
+		for (const header of responseHeaders) {
+			if (
+				header.name.toLowerCase() === "content-security-policy" &&
+				header.value
+			) {
+				const nonce = extractNonceFromCsp(header.value);
+				if (nonce) {
+					const key = `${tabId}:${frameId}`;
+					nonceCache.set(key, nonce);
+					console.log(
+						`[Improv] Captured CSP nonce for tab ${tabId}, frame ${frameId}: ${nonce.slice(0, 8)}...`,
+					);
+				}
+				break;
+			}
+		}
+	},
+	{ urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] },
+	["responseHeaders"],
+);
+
+// Clean up nonces when tabs are closed
+chrome.tabs.onRemoved.addListener((tabId) => {
+	// Remove all nonces for this tab
+	for (const key of nonceCache.keys()) {
+		if (key.startsWith(`${tabId}:`)) {
+			nonceCache.delete(key);
+		}
+	}
+});
+
+// Clean up nonces when navigating away
+chrome.webNavigation.onBeforeNavigate.addListener((details) => {
+	const key = `${details.tabId}:${details.frameId}`;
+	nonceCache.delete(key);
+});
+
+/**
+ * Get the cached nonce for a tab/frame
+ */
+function getNonceForTab(tabId: number, frameId = 0): string | null {
+	return nonceCache.get(`${tabId}:${frameId}`) || null;
+}
+
+// ============================================================================
+// userScripts API Configuration
+// ============================================================================
+
+let userScriptsAvailable = false;
+
+/**
+ * Check if userScripts API is available (Chrome 138+ style check)
+ * Requires "Allow User Scripts" toggle to be enabled in extension settings
+ */
+function isUserScriptsAvailable(): boolean {
+	try {
+		if (!chrome.userScripts) return false;
+		// This throws if the "Allow User Scripts" toggle is not enabled
+		chrome.userScripts.getScripts();
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// Configure the USER_SCRIPT world to enable messaging and relax CSP
+// This allows user scripts to use eval/Function which is needed for dynamic code
+async function configureUserScriptWorld() {
+	try {
+		// Check if userScripts API is available (requires "Allow User Scripts" toggle in Chrome 138+)
+		if (!isUserScriptsAvailable()) {
+			console.warn(
+				"[Improv] userScripts API not available. To enable:\n" +
+					"1. Go to chrome://extensions\n" +
+					"2. Click on 'Improv' extension details\n" +
+					"3. Enable 'Allow User Scripts' toggle\n" +
+					"4. Reload this extension",
+			);
+			return false;
+		}
+
+		// Check if execute method exists (Chrome 135+)
+		if (typeof (chrome.userScripts as any).execute !== "function") {
+			console.warn(
+				"[Improv] chrome.userScripts.execute not available - need Chrome 135+",
+			);
+			return false;
+		}
+
+		await chrome.userScripts.configureWorld({
+			csp: "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+			messaging: true,
+		});
+
+		userScriptsAvailable = true;
+		console.log("[Improv] userScripts API configured successfully");
+		return true;
+	} catch (err) {
+		console.warn("[Improv] Failed to configure userScripts:", err);
+		return false;
+	}
+}
+
+// Initialize on load
+configureUserScriptWorld();
 
 // Open sidepanel when extension icon is clicked
 chrome.action.onClicked.addListener(async (tab) => {
@@ -6,6 +148,44 @@ chrome.action.onClicked.addListener(async (tab) => {
 		await chrome.sidePanel.open({ tabId: tab.id });
 	}
 });
+
+// Script execution results stored in session storage
+// Key: scriptId, Value: { success: boolean, error?: string, timestamp: number }
+interface ScriptExecutionResult {
+	success: boolean;
+	error?: string;
+	timestamp: number;
+}
+
+// Store execution results in chrome.storage.session for persistence across sidepanel reopens
+async function storeExecutionResult(
+	scriptId: string,
+	success: boolean,
+	error?: string,
+) {
+	const result: ScriptExecutionResult = {
+		success,
+		error,
+		timestamp: Date.now(),
+	};
+
+	// Get existing results and update
+	const stored = await chrome.storage.session.get("scriptExecutionResults");
+	const results = stored.scriptExecutionResults || {};
+	results[scriptId] = result;
+	await chrome.storage.session.set({ scriptExecutionResults: results });
+
+	// Notify sidepanel of the update
+	chrome.runtime
+		.sendMessage({
+			type: "SCRIPT_EXECUTION_RESULT",
+			scriptId,
+			...result,
+		})
+		.catch(() => {
+			// Sidepanel might not be open, ignore error
+		});
+}
 
 // Auto-inject matching userscripts when pages load
 chrome.webNavigation.onCompleted.addListener(async (details) => {
@@ -20,30 +200,34 @@ chrome.webNavigation.onCompleted.addListener(async (details) => {
 		const currentUrl = tab.url || details.url;
 
 		for (const script of userscripts) {
-			if (script.enabled) {
+			if (script.enabled && script.jsScript) {
 				try {
 					const regex = new RegExp(script.matchUrls);
 					if (regex.test(currentUrl)) {
 						console.log(`[Improv] Auto-executing userscript: ${script.name}`);
-
-						// Execute using chrome.scripting to bypass CSP
-						await chrome.scripting.executeScript({
-							target: { tabId: details.tabId },
-							world: "MAIN",
-							func: (scriptCode: string, scriptName: string) => {
-								console.log(`[Improv] Executing userscript: ${scriptName}`);
-								try {
-									const fn = new Function(scriptCode);
-									fn();
-								} catch (error) {
-									console.error(`[Improv] Error in userscript ${scriptName}:`, error);
-								}
-							},
-							args: [script.jsScript, script.name],
-						});
+						try {
+							await executeUserScript(details.tabId, script.jsScript);
+							await storeExecutionResult(script.id, true);
+						} catch (execError) {
+							const errorMsg =
+								execError instanceof Error
+									? execError.message
+									: String(execError);
+							console.error(
+								`[Improv] Userscript execution failed: ${script.name}`,
+								errorMsg,
+							);
+							await storeExecutionResult(script.id, false, errorMsg);
+						}
 					}
 				} catch (error) {
-					console.error(`[Improv] Error checking/executing userscript ${script.name}:`, error);
+					const errorMsg =
+						error instanceof Error ? error.message : String(error);
+					console.error(
+						`[Improv] Error checking/executing userscript ${script.name}:`,
+						error,
+					);
+					await storeExecutionResult(script.id, false, errorMsg);
 				}
 			}
 		}
@@ -52,113 +236,175 @@ chrome.webNavigation.onCompleted.addListener(async (details) => {
 	}
 });
 
+/**
+ * Execute a user script in a tab using chrome.userScripts.execute()
+ * This bypasses CSP because USER_SCRIPT world is exempt from page CSP
+ */
+async function executeUserScript(tabId: number, code: string): Promise<void> {
+	await (chrome.userScripts as any).execute({
+		target: { tabId },
+		js: [{ code }],
+		world: "USER_SCRIPT",
+	});
+}
+
 // Message handler for communication between sidepanel and content script
-chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
-	if (message.type === "EXECUTE_JS") {
-		handleExecuteJs(message).then(sendResponse);
-		return true;
-	}
+chrome.runtime.onMessage.addListener(
+	(message: Message, sender, sendResponse) => {
+		if (message.type === "EXECUTE_JS") {
+			handleExecuteJs(message).then(sendResponse);
+			return true;
+		}
 
-	if (message.type === "CAPTURE_PAGE_DATA") {
-		handleCapturePageData(message).then(sendResponse);
-		return true;
-	}
+		if (message.type === "CAPTURE_PAGE_DATA") {
+			handleCapturePageData(message).then(sendResponse);
+			return true;
+		}
 
-	if (message.type === "INJECT_USERSCRIPT") {
-		handleInjectUserscript(message).then(() => sendResponse({ success: true }));
-		return true;
-	}
-});
+		if (message.type === "INJECT_USERSCRIPT") {
+			handleInjectUserscript(message).then(() =>
+				sendResponse({ success: true }),
+			);
+			return true;
+		}
 
-async function handleExecuteJs(request: ExecuteJsRequest): Promise<ExecuteJsResponse> {
-	try {
-		// Use chrome.scripting.executeScript to bypass CSP restrictions
-		// This executes in the MAIN world (page context) instead of ISOLATED world
-		const results = await chrome.scripting.executeScript({
-			target: { tabId: request.tabId },
-			world: "MAIN",
-			func: (code: string) => {
-				// Capture console output
-				const logs: string[] = [];
-				const originalConsole = {
-					log: console.log,
-					error: console.error,
-					warn: console.warn,
-					info: console.info,
-				};
+		// Grab mode handlers - forward to content script
+		if (message.type === "GRAB_MODE_ACTIVATE") {
+			handleGrabModeActivate(message).then(sendResponse);
+			return true;
+		}
 
-				// Override console methods temporarily
-				console.log = (...args: any[]) => {
-					originalConsole.log(...args);
-					logs.push(`[LOG] ${args.map(a => String(a)).join(" ")}`);
-				};
-				console.error = (...args: any[]) => {
-					originalConsole.error(...args);
-					logs.push(`[ERROR] ${args.map(a => String(a)).join(" ")}`);
-				};
-				console.warn = (...args: any[]) => {
-					originalConsole.warn(...args);
-					logs.push(`[WARN] ${args.map(a => String(a)).join(" ")}`);
-				};
-				console.info = (...args: any[]) => {
-					originalConsole.info(...args);
-					logs.push(`[INFO] ${args.map(a => String(a)).join(" ")}`);
-				};
+		if (message.type === "GRAB_MODE_DEACTIVATE") {
+			handleGrabModeDeactivate(message).then(sendResponse);
+			return true;
+		}
 
-				try {
-					// Execute the code using Function constructor (works in MAIN world)
-					const fn = new Function(code);
-					const result = fn();
+		// Forward element selection from content script to sidepanel with screenshot
+		if (message.type === "GRAB_MODE_ELEMENT_SELECTED") {
+			// Capture screenshot while the highlight overlay is still visible
+			handleGrabModeElementSelected(message, sender).then(() => {
+				// Message already sent in handler
+			});
+			return false; // Don't send the original message, we'll send an enhanced one
+		}
 
-					// Restore console
-					console.log = originalConsole.log;
-					console.error = originalConsole.error;
-					console.warn = originalConsole.warn;
-					console.info = originalConsole.info;
+		// Forward grab mode state change from content script to sidepanel
+		if (message.type === "GRAB_MODE_STATE_CHANGE") {
+			// This comes from content script (e.g., user pressed Escape)
+			// The sidepanel listens to runtime.onMessage for this
+			return false;
+		}
+	},
+);
 
-					const output = logs.join("\n") + (result !== undefined ? `\nReturn value: ${String(result)}` : "");
-					return { success: true, output, error: null };
-				} catch (error) {
-					// Restore console
-					console.log = originalConsole.log;
-					console.error = originalConsole.error;
-					console.warn = originalConsole.warn;
-					console.info = originalConsole.info;
+/**
+ * Handle execute_js requests from the sidepanel.
+ *
+ * Uses chrome.userScripts.execute() (Chrome 135+) which runs in the USER_SCRIPT world.
+ * This world is exempt from page CSP, allowing us to execute dynamic code on any site.
+ */
+async function handleExecuteJs(
+	request: ExecuteJsRequest,
+): Promise<ExecuteJsResponse> {
+	// Check if userScripts API is available
+	if (!userScriptsAvailable) {
+		// Try to configure it again in case it wasn't ready before
+		await configureUserScriptWorld();
 
-					return {
-						success: false,
-						output: logs.join("\n"),
-						error: error instanceof Error ? error.message : String(error),
-					};
-				}
-			},
-			args: [request.code],
-		});
-
-		if (results && results[0] && results[0].result) {
-			const result = results[0].result as { success: boolean; output: string; error: string | null };
-			if (result.success) {
-				return {
-					type: "EXECUTE_JS_RESPONSE",
-					requestId: request.requestId,
-					result: result.output,
-				};
-			} else {
-				return {
-					type: "EXECUTE_JS_RESPONSE",
-					requestId: request.requestId,
-					result: result.output,
-					error: result.error || undefined,
-				};
-			}
-		} else {
+		if (!userScriptsAvailable) {
 			return {
 				type: "EXECUTE_JS_RESPONSE",
 				requestId: request.requestId,
 				result: "",
-				error: "No result from script execution",
+				error:
+					"userScripts API not available. Go to chrome://extensions, click on Improv details, and enable 'Allow User Scripts' toggle. Then reload the extension.",
 			};
 		}
+	}
+
+	try {
+		// Wrap the user code to capture console output
+		const wrappedCode = `
+(function() {
+	const logs = [];
+	let error = null;
+
+	const originalLog = console.log;
+	const originalError = console.error;
+	const originalWarn = console.warn;
+	const originalInfo = console.info;
+
+	console.log = (...args) => {
+		originalLog.apply(console, args);
+		try {
+			logs.push("[LOG] " + args.map(a => {
+				if (typeof a === "object") {
+					try { return JSON.stringify(a); } catch { return String(a); }
+				}
+				return String(a);
+			}).join(" "));
+		} catch {}
+	};
+	console.error = (...args) => {
+		originalError.apply(console, args);
+		try { logs.push("[ERROR] " + args.map(a => String(a)).join(" ")); } catch {}
+	};
+	console.warn = (...args) => {
+		originalWarn.apply(console, args);
+		try { logs.push("[WARN] " + args.map(a => String(a)).join(" ")); } catch {}
+	};
+	console.info = (...args) => {
+		originalInfo.apply(console, args);
+		try { logs.push("[INFO] " + args.map(a => String(a)).join(" ")); } catch {}
+	};
+
+	try {
+		${request.code}
+	} catch (e) {
+		error = e instanceof Error ? e.message : String(e);
+		originalError.call(console, "[Improv] Script error:", error);
+	}
+
+	console.log = originalLog;
+	console.error = originalError;
+	console.warn = originalWarn;
+	console.info = originalInfo;
+
+	const output = logs.length > 0
+		? logs.join("\\n")
+		: error ? "" : "Script executed successfully (no console output)";
+
+	return { success: !error, output, error };
+})();
+`;
+
+		// Use chrome.userScripts.execute() - CSP exempt in USER_SCRIPT world
+		const results = await (chrome.userScripts as any).execute({
+			target: { tabId: request.tabId },
+			js: [{ code: wrappedCode }],
+			world: "USER_SCRIPT",
+		});
+
+		if (results?.[0]?.result) {
+			const result = results[0].result as {
+				success: boolean;
+				output: string;
+				error: string | null;
+			};
+			return {
+				type: "EXECUTE_JS_RESPONSE",
+				requestId: request.requestId,
+				result: result.output,
+				error: result.error || undefined,
+			};
+		}
+
+		return {
+			type: "EXECUTE_JS_RESPONSE",
+			requestId: request.requestId,
+			result: "Script executed successfully (no console output)",
+			error: undefined,
+		};
 	} catch (error) {
 		return {
 			type: "EXECUTE_JS_RESPONSE",
@@ -177,7 +423,10 @@ async function ensureContentScript(tabId: number): Promise<boolean> {
 		return true;
 	} catch (error) {
 		// Content script not loaded, try to inject it
-		console.log("Content script not loaded, attempting injection on tab", tabId);
+		console.log(
+			"Content script not loaded, attempting injection on tab",
+			tabId,
+		);
 
 		try {
 			// Get tab info to check if it's a valid URL
@@ -189,10 +438,12 @@ async function ensureContentScript(tabId: number): Promise<boolean> {
 				return false;
 			}
 
-			if (tab.url.startsWith("chrome://") ||
-			    tab.url.startsWith("edge://") ||
-			    tab.url.startsWith("about:") ||
-			    tab.url.startsWith("chrome-extension://")) {
+			if (
+				tab.url.startsWith("chrome://") ||
+				tab.url.startsWith("edge://") ||
+				tab.url.startsWith("about:") ||
+				tab.url.startsWith("chrome-extension://")
+			) {
 				console.error("Cannot inject script on restricted page:", tab.url);
 				return false;
 			}
@@ -222,7 +473,9 @@ async function ensureContentScript(tabId: number): Promise<boolean> {
 	}
 }
 
-async function handleCapturePageData(request: CapturePageDataRequest): Promise<CapturePageDataResponse> {
+async function handleCapturePageData(
+	request: CapturePageDataRequest,
+): Promise<CapturePageDataResponse> {
 	try {
 		// Ensure content script is loaded
 		const scriptLoaded = await ensureContentScript(request.tabId);
@@ -249,13 +502,18 @@ async function handleCapturePageData(request: CapturePageDataRequest): Promise<C
 		}
 
 		// Get HTML and console logs from content script
-		const contentResponse = await chrome.tabs.sendMessage(request.tabId, request) as CapturePageDataResponse;
+		const contentResponse = (await chrome.tabs.sendMessage(
+			request.tabId,
+			request,
+		)) as CapturePageDataResponse;
 
 		// Capture screenshot only if requested (defaults to true for backwards compatibility)
 		let screenshot = "";
 		if (request.includeScreenshot !== false) {
 			try {
-				screenshot = await chrome.tabs.captureVisibleTab(undefined, { format: "png" });
+				screenshot = await chrome.tabs.captureVisibleTab(undefined, {
+					format: "png",
+				});
 			} catch (screenshotError) {
 				console.error("Failed to capture screenshot:", screenshotError);
 				// Continue without screenshot
@@ -279,23 +537,89 @@ async function handleCapturePageData(request: CapturePageDataRequest): Promise<C
 	}
 }
 
-async function handleInjectUserscript(request: InjectUserscriptRequest): Promise<void> {
+async function handleInjectUserscript(
+	request: InjectUserscriptRequest,
+): Promise<void> {
 	try {
-		// Use chrome.scripting.executeScript to bypass CSP restrictions
-		await chrome.scripting.executeScript({
-			target: { tabId: request.tabId },
-			world: "MAIN",
-			func: (script: string) => {
-				try {
-					const fn = new Function(script);
-					fn();
-				} catch (error) {
-					console.error("[Improv] Userscript execution error:", error);
-				}
-			},
-			args: [request.script],
-		});
+		await executeUserScript(request.tabId, request.script);
 	} catch (error) {
 		console.error("Error injecting userscript:", error);
+	}
+}
+
+async function handleGrabModeActivate(
+	request: GrabModeActivateRequest,
+): Promise<{ success: boolean; error?: string }> {
+	try {
+		// Ensure content script is loaded
+		const scriptLoaded = await ensureContentScript(request.tabId);
+		if (!scriptLoaded) {
+			return { success: false, error: "Content script could not be loaded" };
+		}
+
+		// Send activate message to content script
+		await chrome.tabs.sendMessage(request.tabId, {
+			type: "GRAB_MODE_ACTIVATE",
+		});
+		return { success: true };
+	} catch (error) {
+		console.error("Error activating grab mode:", error);
+		return {
+			success: false,
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+async function handleGrabModeDeactivate(
+	request: GrabModeDeactivateRequest,
+): Promise<{ success: boolean; error?: string }> {
+	try {
+		// Send deactivate message to content script
+		await chrome.tabs.sendMessage(request.tabId, {
+			type: "GRAB_MODE_DEACTIVATE",
+		});
+		return { success: true };
+	} catch (error) {
+		console.error("Error deactivating grab mode:", error);
+		return {
+			success: false,
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+async function handleGrabModeElementSelected(
+	message: { type: string; element: unknown },
+	sender: chrome.runtime.MessageSender,
+): Promise<void> {
+	try {
+		// Capture screenshot while the purple highlight overlay is still visible
+		let screenshot = "";
+		try {
+			screenshot = await chrome.tabs.captureVisibleTab(undefined, {
+				format: "png",
+			});
+		} catch (screenshotError) {
+			console.error("Failed to capture grab mode screenshot:", screenshotError);
+			// Continue without screenshot
+		}
+
+		// Send enhanced message with screenshot to sidepanel
+		chrome.runtime.sendMessage({
+			type: "GRAB_MODE_ELEMENT_SELECTED_WITH_SCREENSHOT",
+			element: message.element,
+			screenshot,
+			tabId: sender.tab?.id,
+		});
+	} catch (error) {
+		console.error("Error handling grab mode element selection:", error);
+		// Still forward the original message without screenshot
+		chrome.runtime.sendMessage({
+			type: "GRAB_MODE_ELEMENT_SELECTED_WITH_SCREENSHOT",
+			element: message.element,
+			screenshot: "",
+			tabId: sender.tab?.id,
+		});
 	}
 }

@@ -3,6 +3,7 @@
   "description": "Create custom userscripts for any website using AI. Fix bugs, add features, and customize pages with LLM assistance.",
   "version": "0.1.0",
   "manifest_version": 3,
+  "minimum_chrome_version": "135",
   "icons": {
     "16": "icons/16.png",
     "32": "icons/32.png",
@@ -20,11 +21,14 @@
   },
   "permissions": [
     "storage",
+    "unlimitedStorage",
     "activeTab",
     "scripting",
     "tabs",
     "sidePanel",
-    "webNavigation"
+    "webNavigation",
+    "userScripts",
+    "webRequest"
   ],
   "host_permissions": [
     "<all_urls>"

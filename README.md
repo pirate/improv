@@ -115,3 +115,12 @@ After each `execute_js` call, the user sees the output and can choose:
 - Bun (build tool)
 - Tailwind CSS
 - Chrome Extensions Manifest V3
+
+## Privacy
+
+This extension does not connect to any cloud service and we don't collect any user PII or telemetry from extension users.
+
+The only network requests the extension makes are to the LLM provider (OpenAI by default, using the key you provide), and to GreasyFork/OpenUserJS to fetch the list of applicable user scripts you can import.
+Only the domain portion of the URL is sent to GreasyFork/OpenUserJS (when the extension sidebar is open and no mod is actively being edited) to fetch matching userscripts for import.
+
+Full page HTML and screenshot are sent to the LLM provider so that the model has context to know how to modify the page. OpenAI's privacy policy covering that data can be found here: https://openai.com/policies/row-privacy-policy/

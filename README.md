@@ -130,3 +130,14 @@ The only network requests the extension makes are to the LLM provider (OpenAI by
 Only the domain portion of the URL is sent to GreasyFork/OpenUserJS (when the extension sidebar is open and no mod is actively being edited) to fetch matching userscripts for import.
 
 Full page HTML and screenshot are sent to the LLM provider so that the model has context to know how to modify the page. OpenAI's privacy policy covering that data can be found here: https://openai.com/policies/row-privacy-policy/
+
+## Inspiration
+
+- https://labs.google/disco
+- https://resources.arc.net/hc/en-us/articles/19212718608151-Boosts-Customize-Any-Website
+- https://github.com/dorser/vibemonkey
+- https://chromewebstore.google.com/detail/ai-website-editor/ajlgmdlaokipinhkcbodapinmfmhomof
+- https://github.com/kanpuriyanawab/nebula
+- https://cursor.com/blog/browser-visual-editor
+- https://goedit.me/
+- https://github.com/thetronjohnson/layrr

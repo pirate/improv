@@ -243,19 +243,19 @@ export function App() {
 	};
 
 	// Start/stop elapsed timer
-	const startTimer = () => {
+	const startTimer = useCallback(() => {
 		setElapsedSeconds(0);
 		timerRef.current = setInterval(() => {
 			setElapsedSeconds((prev) => prev + 1);
 		}, 1000);
-	};
+	}, []);
 
-	const stopTimer = () => {
+	const stopTimer = useCallback(() => {
 		if (timerRef.current) {
 			clearInterval(timerRef.current);
 			timerRef.current = null;
 		}
-	};
+	}, []);
 
 	// Helper to update pendingApproval on a chat (persisted per-chat)
 	const setPendingApproval = async (
@@ -449,25 +449,14 @@ export function App() {
 		prevTabIdRef.current = currentTabId;
 	}, [currentTabId, grabModeActive]);
 
+	// Track last Escape press time for double-tap detection
+	const lastEscapeRef = useRef<number>(0);
+
 	// Handle Escape key for various actions
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
 			if (e.key === "Escape") {
-				// First priority: abort LLM request if waiting
-				if (
-					status === "SENDING_TO_LLM" ||
-					status === "WAITING_FOR_LLM_RESPONSE"
-				) {
-					e.preventDefault();
-					if (abortControllerRef.current) {
-						abortControllerRef.current.abort();
-						abortControllerRef.current = null;
-					}
-					setStatus("IDLE");
-					return;
-				}
-
-				// Second priority: exit grab mode
+				// First priority: exit grab mode if active
 				if (grabModeActive && currentTabId) {
 					e.preventDefault();
 					setGrabModeActive(false);
@@ -477,6 +466,28 @@ export function App() {
 					});
 					return;
 				}
+
+				// Second priority: abort LLM request (requires double-tap)
+				if (
+					status === "SENDING_TO_LLM" ||
+					status === "WAITING_FOR_LLM_RESPONSE"
+				) {
+					e.preventDefault();
+					const now = Date.now();
+					const timeSinceLastEscape = now - lastEscapeRef.current;
+					lastEscapeRef.current = now;
+
+					// Require double-tap within 500ms to cancel
+					if (timeSinceLastEscape < 500) {
+						if (abortControllerRef.current) {
+							abortControllerRef.current.abort();
+							abortControllerRef.current = null;
+						}
+						stopTimer();
+						setStatus("IDLE");
+					}
+					return;
+				}
 			}
 		};
 
@@ -484,7 +495,7 @@ export function App() {
 		return () => {
 			document.removeEventListener("keydown", handleKeyDown);
 		};
-	}, [grabModeActive, currentTabId, status]);
+	}, [grabModeActive, currentTabId, status, stopTimer]);
 
 	const loadData = async () => {
 		const scripts = await getUserscripts();

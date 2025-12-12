@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { Highlight, themes } from "prism-react-renderer";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	clearScriptCache,
 	fetchRepositoryScripts,
@@ -32,6 +33,87 @@ import {
 	parseUserscriptMetadata,
 } from "../utils/userscriptParser";
 
+// Simple code editor with syntax highlighting
+function CodeEditor({
+	value,
+	onChange,
+	onBlur,
+	placeholder,
+}: {
+	value: string;
+	onChange: (value: string) => void;
+	onBlur?: () => void;
+	placeholder?: string;
+}) {
+	const textareaRef = useRef<HTMLTextAreaElement>(null);
+	const preRef = useRef<HTMLPreElement>(null);
+
+	const handleScroll = useCallback(() => {
+		if (textareaRef.current && preRef.current) {
+			preRef.current.scrollTop = textareaRef.current.scrollTop;
+			preRef.current.scrollLeft = textareaRef.current.scrollLeft;
+		}
+	}, []);
+
+	return (
+		<div className="relative font-mono text-xs rounded border border-gray-700 bg-[#1e1e1e]">
+			<Highlight
+				theme={themes.vsDark}
+				code={value || placeholder || ""}
+				language="javascript"
+			>
+				{({ style, tokens, getLineProps, getTokenProps }) => (
+					<pre
+						ref={preRef}
+						className="absolute inset-0 m-0 p-2 overflow-auto pointer-events-none"
+						style={{
+							...style,
+							background: "transparent",
+							margin: 0,
+							whiteSpace: "pre-wrap",
+							wordBreak: "break-word",
+						}}
+					>
+						{tokens.map((line, lineIndex) => (
+							// biome-ignore lint/suspicious/noArrayIndexKey: syntax highlighting lines are static
+							<div key={lineIndex} {...getLineProps({ line })}>
+								{line.map((token, tokenIndex) => (
+									<span
+										// biome-ignore lint/suspicious/noArrayIndexKey: tokens within a line are static
+										key={tokenIndex}
+										{...getTokenProps({ token })}
+										style={{
+											...getTokenProps({ token }).style,
+											opacity: !value && placeholder ? 0.5 : 1,
+										}}
+									/>
+								))}
+							</div>
+						))}
+					</pre>
+				)}
+			</Highlight>
+			<textarea
+				ref={textareaRef}
+				value={value}
+				onChange={(e) => onChange(e.target.value)}
+				onBlur={onBlur}
+				onScroll={handleScroll}
+				spellCheck={false}
+				className="relative w-full h-48 p-2 bg-transparent text-transparent caret-white resize-y outline-none"
+				style={
+					{
+						tabSize: 2,
+						MozTabSize: 2,
+						WebkitTextFillColor: "transparent",
+					} as React.CSSProperties
+				}
+				placeholder=""
+			/>
+		</div>
+	);
+}
+
 type StatusState =
 	| "IDLE"
 	| "SENDING_TO_LLM"
@@ -44,7 +126,7 @@ export function App() {
 	const [currentChatId, setCurrentChatId] = useState<string | null>(null);
 	const [currentUrl, setCurrentUrl] = useState<string>("");
 	const [currentTabId, setCurrentTabId] = useState<number | null>(null);
-	const [currentScreenshot, setCurrentScreenshot] = useState<string>("");
+
 	const [showSettings, setShowSettings] = useState(false);
 	const [apiUrl, setApiUrl] = useState(
 		"https://api.openai.com/v1/chat/completions",
@@ -52,35 +134,15 @@ export function App() {
 	const [apiKey, setApiKey] = useState("");
 	const [modelName, setModelName] = useState("gpt-5.2");
 
-	const [pendingApproval, setPendingApprovalState] = useState<{
-		code: string;
-		output: string;
-	} | null>(null);
-
-	// Restore pendingApproval from chrome.storage.session on mount
-	useEffect(() => {
-		chrome.storage.session.get("pendingApproval").then((result) => {
-			if (result.pendingApproval) {
-				setPendingApprovalState(result.pendingApproval);
-			}
-		});
-	}, []);
-
-	// Wrapper to persist pendingApproval to chrome.storage.session
-	const setPendingApproval = (
-		value: { code: string; output: string } | null,
-	) => {
-		if (value) {
-			chrome.storage.session.set({ pendingApproval: value });
-		} else {
-			chrome.storage.session.remove("pendingApproval");
-		}
-		setPendingApprovalState(value);
-	};
 	const [rejectionFeedback, setRejectionFeedback] = useState("");
-	const [awaitingInitialPrompt, setAwaitingInitialPrompt] = useState(false);
 	const [status, setStatus] = useState<StatusState>("IDLE");
 	const [error, setError] = useState<string | null>(null);
+	// Live status counters
+	const [textTokensSent, setTextTokensSent] = useState(0);
+	const [imageSizeKb, setImageSizeKb] = useState(0);
+	const [tokensReceived, setTokensReceived] = useState(0);
+	const [elapsedSeconds, setElapsedSeconds] = useState(0);
+	const timerRef = useRef<NodeJS.Timeout | null>(null);
 	const [expandedSystemPrompt, setExpandedSystemPrompt] = useState(false);
 	const [expandedHtml, setExpandedHtml] = useState(false);
 	const [repositoryScripts, setRepositoryScripts] = useState<
@@ -104,10 +166,8 @@ export function App() {
 	const [editingMessageContent, setEditingMessageContent] = useState("");
 	const chatInputRef = useRef<HTMLTextAreaElement>(null);
 	const editInputRef = useRef<HTMLTextAreaElement>(null);
-	const messagesContainerRef = useRef<HTMLDivElement>(null);
 	// Abort controller for cancelling LLM requests
 	const abortControllerRef = useRef<AbortController | null>(null);
-	const lastScreenshotCaptureRef = useRef<number>(0);
 	// Script execution results (scriptId -> { success, error?, timestamp })
 	const [scriptExecutionResults, setScriptExecutionResults] = useState<
 		Record<string, { success: boolean; error?: string; timestamp: number }>
@@ -116,6 +176,14 @@ export function App() {
 	const currentChat = currentChatId
 		? chatHistories.find((c) => c.id === currentChatId)
 		: null;
+
+	// Derive pendingApproval from current chat (persisted per-chat)
+	const pendingApproval = currentChat?.pendingApproval ?? null;
+
+	// Derive awaitingInitialPrompt from chat state (no messages yet means waiting for first prompt)
+	const awaitingInitialPrompt = currentChat
+		? currentChat.messages.length === 0 && !currentChat.initialPrompt
+		: false;
 
 	const currentDomain = getDomainFromUrl(currentUrl);
 	const domainChatHistories = chatHistories
@@ -140,6 +208,69 @@ export function App() {
 		await chrome.storage.session.set({ scriptExecutionResults: results });
 	};
 
+	// Estimate token count and image size from request body
+	const estimateRequestStats = (
+		text: string,
+	): { textTokens: number; imageSizeKb: number } => {
+		// Extract base64 image data and calculate size
+		const base64Matches = text.match(
+			/data:image\/[^;]+;base64,([A-Za-z0-9+/=]+)/g,
+		);
+		let totalImageBytes = 0;
+		if (base64Matches) {
+			for (const fullMatch of base64Matches) {
+				// Extract just the base64 data part after the comma
+				const base64Data = fullMatch.split(",")[1] || "";
+				// Base64 encodes 3 bytes into 4 chars, so decode size = length * 3/4
+				totalImageBytes += Math.floor((base64Data.length * 3) / 4);
+			}
+		}
+		const imageSizeKb = totalImageBytes / 1024;
+
+		// Text tokens: ~4 chars per token (excluding image data)
+		const textWithoutImages = text.replace(
+			/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/g,
+			"",
+		);
+		const textTokens = Math.ceil(textWithoutImages.length / 4);
+
+		return { textTokens, imageSizeKb };
+	};
+
+	// Estimate tokens from response text
+	const estimateResponseTokens = (text: string): number => {
+		return Math.ceil(text.length / 4);
+	};
+
+	// Start/stop elapsed timer
+	const startTimer = () => {
+		setElapsedSeconds(0);
+		timerRef.current = setInterval(() => {
+			setElapsedSeconds((prev) => prev + 1);
+		}, 1000);
+	};
+
+	const stopTimer = () => {
+		if (timerRef.current) {
+			clearInterval(timerRef.current);
+			timerRef.current = null;
+		}
+	};
+
+	// Helper to update pendingApproval on a chat (persisted per-chat)
+	const setPendingApproval = async (
+		chatId: string,
+		value: { jsScript: string; output: string } | null,
+	) => {
+		const chat = chatHistories.find((c) => c.id === chatId);
+		if (!chat) return;
+
+		chat.pendingApproval = value;
+		chat.updatedAt = Date.now();
+		await saveChatHistory(chat);
+		setChatHistories([...chatHistories]);
+	};
+
 	useEffect(() => {
 		loadData();
 		updateCurrentTab();
@@ -152,11 +283,22 @@ export function App() {
 		});
 
 		// Listen for tab changes
-		const handleTabUpdate = () => {
+		const handleTabActivated = () => {
 			updateCurrentTab();
 		};
-		chrome.tabs.onActivated.addListener(handleTabUpdate);
-		chrome.tabs.onUpdated.addListener(handleTabUpdate);
+		// Only listen for updates on the active tab to avoid excessive calls
+		const handleTabUpdated = (
+			tabId: number,
+			changeInfo: chrome.tabs.TabChangeInfo,
+			tab: chrome.tabs.Tab,
+		) => {
+			// Only respond to URL changes on the active tab
+			if (tab.active && changeInfo.url) {
+				updateCurrentTab();
+			}
+		};
+		chrome.tabs.onActivated.addListener(handleTabActivated);
+		chrome.tabs.onUpdated.addListener(handleTabUpdated);
 
 		// Listen for script execution result updates
 		const handleMessage = (message: {
@@ -180,8 +322,8 @@ export function App() {
 		chrome.runtime.onMessage.addListener(handleMessage);
 
 		return () => {
-			chrome.tabs.onActivated.removeListener(handleTabUpdate);
-			chrome.tabs.onUpdated.removeListener(handleTabUpdate);
+			chrome.tabs.onActivated.removeListener(handleTabActivated);
+			chrome.tabs.onUpdated.removeListener(handleTabUpdated);
 			chrome.runtime.onMessage.removeListener(handleMessage);
 		};
 	}, []);
@@ -348,30 +490,8 @@ export function App() {
 		const scripts = await getUserscripts();
 		const histories = await getChatHistories();
 
-		// Filter out incompatible data (scripts must have chatHistoryId property, can be null or string)
-		// Use 'in' operator to check if property exists, rather than checking value
-		const validScripts = scripts.filter(
-			(s) => s && typeof s === "object" && "chatHistoryId" in s,
-		);
-		const validHistories = histories.filter(
-			(h) => h && typeof h === "object" && "domain" in h && h.domain,
-		);
-
-		console.log(
-			"Loaded scripts:",
-			scripts.length,
-			"Valid:",
-			validScripts.length,
-		);
-		console.log(
-			"Loaded histories:",
-			histories.length,
-			"Valid:",
-			validHistories.length,
-		);
-
-		setUserscripts(validScripts as Userscript[]);
-		setChatHistories(validHistories as ChatHistory[]);
+		setUserscripts(scripts);
+		setChatHistories(histories);
 		const settings = await getSettings();
 		setApiUrl(settings.apiUrl ?? "https://api.openai.com/v1/chat/completions");
 		setApiKey(settings.apiKey ?? "");
@@ -382,62 +502,24 @@ export function App() {
 		const tab = await getCurrentTab();
 		if (tab) {
 			const newUrl = tab.url || "";
-			const oldUrl = currentUrl;
-			const oldDomain = getDomainFromUrl(oldUrl);
+			const oldDomain = getDomainFromUrl(currentUrl);
 			const newDomain = getDomainFromUrl(newUrl);
 
 			setCurrentUrl(newUrl);
 			setCurrentTabId(tab.id || null);
 
-			// Capture screenshot for preview, debounced to max 1x/second to avoid quota limits
-			if (tab.id) {
-				const now = Date.now();
-				const timeSinceLastCapture = now - lastScreenshotCaptureRef.current;
-
-				// Only capture if at least 1 second has passed since last capture
-				if (timeSinceLastCapture >= 1000) {
-					lastScreenshotCaptureRef.current = now;
-					try {
-						const pageData = await capturePageData(tab.id, true);
-						setCurrentScreenshot(pageData.screenshot);
-
-						// If URL changed within same domain and we have a current chat, update its context
-						// Note: We update the in-memory chat but don't save screenshots to storage
-						// Fresh page data will be captured when sending messages to LLM
-						if (
-							newUrl !== oldUrl &&
-							newDomain === oldDomain &&
-							currentChatId &&
-							pageData.html
-						) {
-							const chat = chatHistories.find((c) => c.id === currentChatId);
-							if (chat) {
-								// Update the chat's page context in memory for next LLM call
-								chat.initialUrl = pageData.url || newUrl;
-								chat.initialScreenshot = pageData.screenshot; // Keep in memory
-								chat.initialHtml = pageData.html;
-								chat.initialConsoleLog = pageData.consoleLog;
-								chat.updatedAt = Date.now();
-								// Don't save to storage on every navigation - too much data
-								// saveChatHistory will be called when user sends a message
-								setChatHistories([...chatHistories]);
-							}
-						}
-					} catch (error) {
-						console.error("Failed to capture screenshot:", error);
-						setCurrentScreenshot("");
-					}
-				}
-			}
+			// Note: Screenshots are only captured on-demand:
+			// 1. When sending LLM request (in sendMessageToLLM)
+			// 2. When user clicks in grab mode (in background.ts handleGrabModeElementSelected)
 
 			// If domain changed, update the UI
 			if (newDomain !== oldDomain) {
 				// Clear UI state
+				// Clear transient UI state on domain change
+				// Note: pendingApproval is per-chat and persisted, no need to clear
 				setError(null);
-				setAwaitingInitialPrompt(false);
 				setExpandedSystemPrompt(false);
 				setExpandedHtml(false);
-				setPendingApproval(null);
 
 				// Load fresh chat histories and find most recent for this domain
 				const histories = await getChatHistories();
@@ -533,8 +615,6 @@ export function App() {
 			const newChat: ChatHistory = {
 				id: chatId,
 				domain,
-				apiUrl,
-				modelName,
 				messages: [],
 				initialPrompt: "", // Will be filled when user sends first message
 				initialUrl: pageData.url,
@@ -563,7 +643,7 @@ export function App() {
 			setChatHistories([...chatHistories, newChat]);
 			setUserscripts([...userscripts, newScript]);
 			setCurrentChatId(chatId);
-			setAwaitingInitialPrompt(true);
+			// Note: awaitingInitialPrompt is now derived from chat.messages.length === 0
 
 			// Focus the input field
 			setTimeout(() => {
@@ -643,7 +723,7 @@ export function App() {
 
 	const executeJs = async (
 		tabId: number,
-		code: string,
+		jsScript: string,
 	): Promise<{ result: string; error?: string }> => {
 		const requestId = generateUUID();
 		return new Promise((resolve) => {
@@ -651,7 +731,7 @@ export function App() {
 				{
 					type: "EXECUTE_JS",
 					tabId,
-					code,
+					jsScript,
 					requestId,
 				},
 				(response) => {
@@ -670,14 +750,14 @@ export function App() {
 			consoleLog: string;
 			url: string;
 		},
+		elementsWithScreenshots?: GrabbedElement[],
 	) => {
 		const chat = chatHistories.find((c) => c.id === chatId);
 		if (!chat || !currentTabId) return;
 
-		// If this is the initial prompt, update the chat
-		if (awaitingInitialPrompt && !chat.initialPrompt) {
+		// If this is the initial prompt (first message), save it to the chat
+		if (!chat.initialPrompt && chat.messages.length === 0) {
 			chat.initialPrompt = userMessage;
-			setAwaitingInitialPrompt(false);
 		}
 
 		setStatus("SENDING_TO_LLM");
@@ -685,11 +765,6 @@ export function App() {
 		// Always capture fresh page data including screenshot for current DOM state
 		const currentPageData =
 			pageData || (await capturePageData(currentTabId, true));
-
-		// Update last capture time to coordinate with tab update debouncing
-		if (!pageData) {
-			lastScreenshotCaptureRef.current = Date.now();
-		}
 
 		// Update chat's page context with fresh data so LLM always sees current state
 		if (currentPageData.url && currentPageData.html) {
@@ -737,17 +812,26 @@ export function App() {
 			? "Current page DOM structure (simplified tree representation due to page size):"
 			: "Current page HTML (high-entropy strings like data URLs have been truncated):";
 
+		// Include current script in the prompt so LLM knows what to edit
+		const currentScriptSection = currentScript?.jsScript
+			? `\nCurrent userscript (edit this to make changes):
+\`\`\`javascript
+${currentScript.jsScript}
+\`\`\`
+`
+			: "\nNo userscript exists yet - create a new one.";
+
 		messages.push({
 			role: "system",
-			content: `You are an AI assistant that helps users create custom JavaScript code to modify web pages. You have two tools available:
+			content: `You are an AI assistant that helps users create custom JavaScript userscripts to modify web pages. You have two tools available:
 
-1. execute_js(code: string) - Execute JavaScript code on the current page and see the output. Use this to test changes and explore the page structure.
+1. execute_js(jsScript: string) - Execute JavaScript on the current page and see the output. The page will be refreshed and the script will run. Use this to test changes.
 2. submit_final_userscript(matchUrls: string, jsScript: string) - Submit the final userscript when ready. matchUrls should be a regex pattern matching the target URLs.
 
 After each execute_js call, ask the user if the changes look correct. If yes, save using submit_final_userscript. If no, continue iterating based on their feedback.
 
 Current page URL: ${currentPageData.url || chat.initialUrl}
-
+${currentScriptSection}
 ${htmlDescription}
 ${htmlContent}
 
@@ -758,23 +842,85 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 		// Use grab screenshot if available (shows highlighted elements), otherwise use current page screenshot
 		const screenshotToUse = grabScreenshot || currentPageData.screenshot;
 
+		// Check if we have element screenshots to include
+		const hasElementScreenshots = elementsWithScreenshots?.some(
+			(el) => el.screenshot,
+		);
+
 		// Add initial context if this is the first message (with screenshot)
-		if (chat.messages.length === 1 && screenshotToUse) {
+		if (
+			chat.messages.length === 1 &&
+			(screenshotToUse || hasElementScreenshots)
+		) {
 			const content: (
 				| { type: "text"; text: string }
 				| { type: "image_url"; image_url: { url: string } }
 			)[] = [
 				{
 					type: "text",
-					text: `User request: ${userMessage}${grabScreenshot ? "\n\n(Screenshot shows the element(s) I selected highlighted in purple)" : ""}`,
+					text: `User request: ${userMessage}${grabScreenshot ? "\n\n(Full page screenshot shows the element(s) I selected highlighted in purple)" : ""}`,
 				},
-				{
+			];
+
+			// Add full page screenshot
+			if (screenshotToUse) {
+				content.push({
 					type: "image_url",
 					image_url: {
 						url: screenshotToUse,
 					},
+				});
+			}
+
+			// Add individual element screenshots
+			if (elementsWithScreenshots) {
+				for (const el of elementsWithScreenshots) {
+					if (el.screenshot) {
+						content.push({
+							type: "text",
+							text: `\nScreenshot of selected element (${el.tagName}, xpath: ${el.xpath}):`,
+						});
+						content.push({
+							type: "image_url",
+							image_url: {
+								url: el.screenshot,
+							},
+						});
+					}
+				}
+			}
+
+			messages.push({
+				role: "user",
+				content,
+			});
+		} else if (hasElementScreenshots) {
+			// Not first message but has element screenshots - add them with the user message
+			const content: (
+				| { type: "text"; text: string }
+				| { type: "image_url"; image_url: { url: string } }
+			)[] = [
+				{
+					type: "text",
+					text: userMessage,
 				},
 			];
+
+			// Add individual element screenshots
+			for (const el of elementsWithScreenshots || []) {
+				if (el.screenshot) {
+					content.push({
+						type: "text",
+						text: `\nScreenshot of selected element (${el.tagName}, xpath: ${el.xpath}):`,
+					});
+					content.push({
+						type: "image_url",
+						image_url: {
+							url: el.screenshot,
+						},
+					});
+				}
+			}
 
 			messages.push({
 				role: "user",
@@ -823,10 +969,65 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 
 		// Call OpenAI API
 		try {
-			setStatus("WAITING_FOR_LLM_RESPONSE");
-
 			// Create abort controller for this request
 			abortControllerRef.current = new AbortController();
+
+			// Build request body
+			const requestBody = JSON.stringify({
+				model: modelName,
+				messages,
+				tools: [
+					{
+						type: "function",
+						function: {
+							name: "execute_js",
+							description:
+								"Execute JavaScript code on the current page to test changes. The page will be refreshed and the script will run.",
+							parameters: {
+								type: "object",
+								properties: {
+									jsScript: {
+										type: "string",
+										description: "The JavaScript code to execute",
+									},
+								},
+								required: ["jsScript"],
+							},
+						},
+					},
+					{
+						type: "function",
+						function: {
+							name: "submit_final_userscript",
+							description:
+								"Submit the final userscript when the changes are approved by the user",
+							parameters: {
+								type: "object",
+								properties: {
+									matchUrls: {
+										type: "string",
+										description:
+											"Regex pattern for matching URLs where this script should run",
+									},
+									jsScript: {
+										type: "string",
+										description:
+											"The final JavaScript jsScript for the userscript",
+									},
+								},
+								required: ["matchUrls", "jsScript"],
+							},
+						},
+					},
+				],
+			});
+
+			// Estimate and show tokens/image size being sent
+			const stats = estimateRequestStats(requestBody);
+			setTextTokensSent(stats.textTokens);
+			setImageSizeKb(stats.imageSizeKb);
+			setTokensReceived(0);
+			setStatus("SENDING_TO_LLM");
 
 			const response = await fetch(apiUrl, {
 				method: "POST",
@@ -835,58 +1036,16 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 					Authorization: `Bearer ${apiKey}`,
 				},
 				signal: abortControllerRef.current.signal,
-				body: JSON.stringify({
-					model: modelName,
-					messages,
-					tools: [
-						{
-							type: "function",
-							function: {
-								name: "execute_js",
-								description:
-									"Execute JavaScript code on the current page to test changes",
-								parameters: {
-									type: "object",
-									properties: {
-										code: {
-											type: "string",
-											description: "The JavaScript code to execute",
-										},
-									},
-									required: ["code"],
-								},
-							},
-						},
-						{
-							type: "function",
-							function: {
-								name: "submit_final_userscript",
-								description:
-									"Submit the final userscript when the changes are approved by the user",
-								parameters: {
-									type: "object",
-									properties: {
-										matchUrls: {
-											type: "string",
-											description:
-												"Regex pattern for matching URLs where this script should run",
-										},
-										jsScript: {
-											type: "string",
-											description:
-												"The final JavaScript code for the userscript",
-										},
-									},
-									required: ["matchUrls", "jsScript"],
-								},
-							},
-						},
-					],
-				}),
+				body: requestBody,
 			});
+
+			// Start timer and switch to waiting status
+			setStatus("WAITING_FOR_LLM_RESPONSE");
+			startTimer();
 
 			// Check response status first
 			if (!response.ok) {
+				stopTimer();
 				let errorMessage = `API error: ${response.status} ${response.statusText}`;
 				try {
 					const errorData = await response.json();
@@ -907,12 +1066,26 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 				throw new Error(errorMessage);
 			}
 
-			let data;
+			let data: {
+				choices?: { message: { content: string; tool_calls?: unknown[] } }[];
+				error?: { message?: string };
+				usage?: { completion_tokens?: number };
+			};
 			try {
-				data = await response.json();
+				const responseText = await response.text();
+				// Estimate tokens from response size
+				setTokensReceived(estimateResponseTokens(responseText));
+				data = JSON.parse(responseText);
+				// Use actual token count if available
+				if (data.usage?.completion_tokens) {
+					setTokensReceived(data.usage.completion_tokens);
+				}
 			} catch (parseError) {
+				stopTimer();
 				throw new Error("Failed to parse API response as JSON");
 			}
+
+			stopTimer();
 
 			// Check for missing choices
 			if (!data.choices || data.choices.length === 0) {
@@ -927,35 +1100,75 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 					if (toolCall.function.name === "execute_js") {
 						setStatus("RUNNING_JS_ON_PAGE");
 						const args = JSON.parse(toolCall.function.arguments);
-						const result = await executeJs(currentTabId, args.code);
+						const newScript = args.jsScript;
 
-						// Also save the code to the userscript so user can see it in the editor
+						// Get the old script from the most recent user message's snapshot
+						const lastUserMsg = [...chat.messages]
+							.reverse()
+							.find((m) => m.role === "user" && m.scriptSnapshot);
+						const oldScript = lastUserMsg?.scriptSnapshot?.jsScript || "";
+
+						// Calculate diff stats
+						const oldLines = oldScript ? oldScript.split("\n").length : 0;
+						const newLines = newScript ? newScript.split("\n").length : 0;
+						const linesRemoved = Math.max(
+							0,
+							oldLines -
+								newLines +
+								(oldScript ? Math.floor(oldLines * 0.3) : 0),
+						);
+						const linesAdded = Math.max(
+							0,
+							newLines -
+								oldLines +
+								(oldScript ? Math.floor(newLines * 0.3) : newLines),
+						);
+
+						// Simple diff: count lines that changed
+						const oldSet = new Set(
+							oldScript
+								.split("\n")
+								.map((l) => l.trim())
+								.filter(Boolean),
+						);
+						const newSet = new Set(
+							newScript
+								.split("\n")
+								.map((l) => l.trim())
+								.filter(Boolean),
+						);
+						const removed = [...oldSet].filter((l) => !newSet.has(l)).length;
+						const added = [...newSet].filter((l) => !oldSet.has(l)).length;
+
+						// Save the script to the userscript so user can see it in the editor
 						const scriptToUpdate = userscripts.find(
 							(s) => s.chatHistoryId === chatId,
 						);
 						if (scriptToUpdate) {
-							scriptToUpdate.jsScript = args.code;
+							scriptToUpdate.jsScript = newScript;
 							scriptToUpdate.updatedAt = Date.now();
-							// Don't enable yet - wait for user approval
 							await saveUserscript(scriptToUpdate);
 							// Clear stale execution result since script changed
 							await clearExecutionResult(scriptToUpdate.id);
 							setUserscripts([...userscripts]);
 						}
 
-						// Store pending approval with output info
-						const output = result.error
-							? `Error: ${result.error}`
-							: result.result ||
-								"Script executed successfully (no console output)";
+						// Refresh the page - the script will auto-execute via webNavigation.onCompleted
+						// (since scripts with jsScript are auto-injected on matching pages)
+						chrome.tabs.reload(currentTabId);
 
+						// Build diff summary for output
+						const diffSummary = oldScript
+							? `-${removed} lines removed\n+${added} lines added\n(page refreshed)`
+							: `+${newLines} lines added\n(page refreshed)`;
+
+						// Set pending approval
 						console.log("[Improv] Setting pendingApproval:", {
-							code: args.code.slice(0, 100),
-							output,
+							jsScript: newScript.slice(0, 100),
 						});
-						setPendingApproval({
-							code: args.code,
-							output,
+						await setPendingApproval(chatId, {
+							jsScript: newScript,
+							output: diffSummary,
 						});
 
 						// Add assistant message with tool call
@@ -981,9 +1194,7 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 							toolResults: [
 								{
 									toolCallId: toolCall.id,
-									output: result.error
-										? `Error: ${result.error}`
-										: result.result,
+									output: diffSummary,
 								},
 							],
 						};
@@ -1005,13 +1216,13 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 
 						let updatedScript: Userscript;
 						if (existingScript) {
-							// Update existing userscript with LLM's code
+							// Update existing userscript with LLM's jsScript
 							existingScript.matchUrls = args.matchUrls;
 							existingScript.jsScript = args.jsScript;
 							existingScript.name =
 								chat.initialPrompt?.slice(0, 100) ||
 								`Script for ${new URL(chat.initialUrl).hostname}`;
-							existingScript.enabled = true; // Enable now that it has code
+							existingScript.enabled = true; // Enable now that it has jsScript
 							existingScript.updatedAt = Date.now();
 							updatedScript = existingScript;
 
@@ -1065,14 +1276,14 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 				await saveChatHistory(chat);
 				setChatHistories([...chatHistories]);
 
-				// Try to extract and save code from the message
+				// Try to extract and save jsScript from the message
 				if (assistantMessage.content) {
-					const codeSaved = await extractAndSaveCodeFromMessage(
+					const jsScriptSaved = await extractAndSaveCodeFromMessage(
 						assistantMessage.content,
 						chatId,
 					);
-					if (codeSaved) {
-						// Add a note that the code was auto-saved
+					if (jsScriptSaved) {
+						// Add a note that the jsScript was auto-saved
 						const savedMsg: ChatMessage = {
 							id: generateUUID(),
 							role: "assistant",
@@ -1088,6 +1299,7 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 				setStatus("IDLE");
 			}
 		} catch (error) {
+			stopTimer();
 			// Check if this was an abort (user pressed Escape)
 			if (error instanceof Error && error.name === "AbortError") {
 				// Don't add error message, just reset status
@@ -1144,24 +1356,38 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 			timestamp: Date.now(),
 		};
 		chat.messages.push(confirmMsg);
+		chat.pendingApproval = null; // Clear pending approval
 		chat.updatedAt = Date.now();
 		await saveChatHistory(chat);
 		setChatHistories([...chatHistories]);
-
-		setPendingApproval(null);
 	};
 
 	const handleReject = async (action: "continue" | "refresh") => {
+		if (!currentChatId) return;
 		const feedback = rejectionFeedback.trim();
-		setPendingApproval(null);
+		await setPendingApproval(currentChatId, null);
 		setRejectionFeedback("");
 
 		if (action === "continue" && currentChatId) {
 			// Keep iterating - send feedback to LLM to refine the draft
-			const message = feedback
-				? `That didn't work. ${feedback}`
+			const grabbedContext = formatGrabbedElementsForPrompt();
+			let message = feedback
+				? feedback
 				: "That didn't work as expected. Please try a different approach.";
-			await sendMessageToLLM(currentChatId, message);
+
+			// Include any grabbed elements selected during feedback
+			if (grabbedContext) {
+				message += `\n\nHere are the elements I selected:${grabbedContext}`;
+			}
+
+			// Pass grabbed elements with their screenshots
+			const elementsToSend =
+				grabbedElements.length > 0 ? [...grabbedElements] : undefined;
+			await sendMessageToLLM(currentChatId, message, undefined, elementsToSend);
+
+			// Clear grabbed elements after sending
+			setGrabbedElements([]);
+			setGrabScreenshot(null);
 		} else if (action === "refresh" && currentChatId) {
 			// Start over - clear chat messages and reset script draft
 			const chat = chatHistories.find((c) => c.id === currentChatId);
@@ -1200,11 +1426,15 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 		// Reset textarea height
 		input.style.height = "auto";
 
+		// Capture grabbed elements before clearing (for screenshots)
+		const elementsToSend =
+			grabbedElements.length > 0 ? [...grabbedElements] : undefined;
+
 		// Append grabbed elements context if any
 		const grabbedContext = formatGrabbedElementsForPrompt();
 		if (grabbedContext) {
 			message = `${message}\n\nThe user has selected the following elements on the page for context:${grabbedContext}`;
-			// Clear grabbed elements and screenshot after sending
+			// Clear grabbed elements and screenshot after capturing
 			setGrabbedElements([]);
 			setGrabScreenshot(null);
 			// Deactivate grab mode
@@ -1226,9 +1456,9 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 				consoleLog: chat.initialConsoleLog,
 				url: chat.initialUrl,
 			};
-			await sendMessageToLLM(currentChatId, message, pageData);
+			await sendMessageToLLM(currentChatId, message, pageData, elementsToSend);
 		} else {
-			await sendMessageToLLM(currentChatId, message);
+			await sendMessageToLLM(currentChatId, message, undefined, elementsToSend);
 		}
 	};
 
@@ -1238,16 +1468,14 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 
 		// Delete both the userscript and its associated chat history
 		await deleteUserscript(id);
-		if (script.chatHistoryId) {
-			await deleteChatHistory(script.chatHistoryId);
-			setChatHistories(
-				chatHistories.filter((c) => c.id !== script.chatHistoryId),
-			);
+		await deleteChatHistory(script.chatHistoryId);
+		setChatHistories(
+			chatHistories.filter((c) => c.id !== script.chatHistoryId),
+		);
 
-			// If we're currently viewing this chat, clear it
-			if (currentChatId === script.chatHistoryId) {
-				setCurrentChatId(null);
-			}
+		// If we're currently viewing this chat, clear it
+		if (currentChatId === script.chatHistoryId) {
+			setCurrentChatId(null);
 		}
 		setUserscripts(userscripts.filter((s) => s.id !== id));
 	};
@@ -1267,11 +1495,11 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 	const handleImportScript = async (repoScript: RepositoryScript) => {
 		setImportingScriptId(repoScript.id);
 		try {
-			// Fetch the script code
-			const code = await fetchScriptCode(repoScript.codeUrl);
+			// Fetch the script jsScript
+			const jsScript = await fetchScriptCode(repoScript.jsScriptUrl);
 
 			// Parse metadata from the script
-			const metadata = parseUserscriptMetadata(code);
+			const metadata = parseUserscriptMetadata(jsScript);
 			const matchRegex = metadataToMatchRegex(metadata);
 
 			const sourceName =
@@ -1305,8 +1533,6 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 			const newChat: ChatHistory = {
 				id: chatId,
 				domain,
-				apiUrl,
-				modelName,
 				messages: [],
 				initialPrompt: `Imported: ${repoScript.name} (from ${sourceName})`,
 				initialUrl: pageData.url || currentUrl,
@@ -1322,14 +1548,13 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 				id: scriptId,
 				name: metadata.name || repoScript.name,
 				matchUrls: matchRegex,
-				jsScript: code,
+				jsScript: jsScript,
 				chatHistoryId: chatId,
 				createdAt: Date.now(),
 				updatedAt: Date.now(),
 				enabled: true,
 				sourceUrl: repoScript.url,
-				sourceType:
-					repoScript.source === "openuserjs" ? "openusersjs" : "greasyfork",
+				sourceType: repoScript.source,
 			};
 
 			await saveChatHistory(newChat);
@@ -1413,7 +1638,7 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 		handleCancelEditMessage();
 
 		// Clear pending approval since we're resending
-		setPendingApproval(null);
+		currentChat.pendingApproval = null;
 
 		// Send the edited message to the LLM
 		await sendMessageToLLM(currentChat.id, editingMessageContent.trim());
@@ -1432,6 +1657,7 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 
 		// Truncate chat history to this point (keep messages up to and including this one)
 		currentChat.messages = currentChat.messages.slice(0, messageIndex + 1);
+		currentChat.pendingApproval = null; // Clear pending approval on revert
 		currentChat.updatedAt = Date.now();
 
 		// Restore script snapshot if available
@@ -1448,9 +1674,6 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 
 		await saveChatHistory(currentChat);
 		setChatHistories([...chatHistories]);
-
-		// Clear any pending approval since we reverted
-		setPendingApproval(null);
 	};
 
 	// Grab mode handlers
@@ -1510,24 +1733,27 @@ ${el.outerHTML}`;
 			.join("\n");
 	};
 
-	// Extract JavaScript code blocks from LLM response and save to userscript
+	// Extract JavaScript jsScript blocks from LLM response and save to userscript
 	const extractAndSaveCodeFromMessage = async (
 		content: string,
 		chatId: string,
 	): Promise<boolean> => {
-		// Match code blocks with js/javascript language or userscript metadata
-		const codeBlockRegex = /```(?:js|javascript)?\s*\n([\s\S]*?)```/gi;
-		const matches = [...content.matchAll(codeBlockRegex)];
+		// Match jsScript blocks with js/javascript language or userscript metadata
+		const jsScriptBlockRegex = /```(?:js|javascript)?\s*\n([\s\S]*?)```/gi;
+		const matches = [...content.matchAll(jsScriptBlockRegex)];
 
 		if (matches.length === 0) return false;
 
-		// Find the largest code block (likely the main script)
+		// Find the largest jsScript block (likely the main script)
 		let bestCode = "";
 		for (const match of matches) {
-			const code = match[1].trim();
-			// Prefer code with userscript metadata, otherwise take the longest
-			if (code.includes("==UserScript==") || code.length > bestCode.length) {
-				bestCode = code;
+			const jsScript = match[1].trim();
+			// Prefer jsScript with userscript metadata, otherwise take the longest
+			if (
+				jsScript.includes("==UserScript==") ||
+				jsScript.length > bestCode.length
+			) {
+				bestCode = jsScript;
 			}
 		}
 
@@ -1543,10 +1769,10 @@ ${el.outerHTML}`;
 		script.updatedAt = Date.now();
 
 		// Try to extract match pattern from userscript metadata
-		const matchPatterns = bestCode.match(/@match\s+(.+)/g);
-		if (matchPatterns && matchPatterns.length > 0) {
+		const matchUrlss = bestCode.match(/@match\s+(.+)/g);
+		if (matchUrlss && matchUrlss.length > 0) {
 			// Convert @match patterns to regex
-			const patterns = matchPatterns
+			const patterns = matchUrlss
 				.map((m) => m.replace("@match", "").trim())
 				.map((p) =>
 					p.replace(/\*/g, ".*").replace(/\?/g, ".").replace(/\//g, "\\/"),
@@ -1741,6 +1967,7 @@ ${el.outerHTML}`;
 										width={svgW}
 										height={svgH}
 										viewBox={`0 0 ${svgW} ${svgH}`}
+										aria-hidden="true"
 									>
 										<defs>
 											<linearGradient
@@ -1780,7 +2007,8 @@ ${el.outerHTML}`;
 												const sx = oX + gx + (brickD - gy) * isoRatio;
 												const sy = oY + gy * isoRatio;
 												return (
-													<g key={`${row}-${col}`}>
+													// biome-ignore lint/suspicious/noArrayIndexKey: static grid positions that never reorder
+													<g key={`stud-${row}-${col}`}>
 														{/* Cylinder side */}
 														<path
 															d={`M${sx - studR},${sy} v${-studH} a${studR},${studR * isoRatio} 0 0,1 ${studR * 2},0 v${studH} a${studR},${studR * isoRatio} 0 0,1 ${-studR * 2},0`}
@@ -2098,10 +2326,11 @@ ${el.outerHTML}`;
 											type="button"
 											onClick={async () => {
 												currentChat.messages = [];
+												currentChat.pendingApproval = null;
+												currentChat.initialPrompt = ""; // Allow re-entering initial prompt
 												currentChat.updatedAt = Date.now();
 												await saveChatHistory(currentChat);
 												setChatHistories([...chatHistories]);
-												setPendingApproval(null);
 											}}
 											className="px-2 py-1 text-[10px] bg-gray-100 text-gray-600 rounded hover:bg-gray-200"
 											title="Clear chat history"
@@ -2133,29 +2362,46 @@ ${el.outerHTML}`;
 									placeholder="Match URLs (regex)"
 								/>
 								<details className="text-xs" open={!!pendingApproval}>
-									<summary className="cursor-pointer text-gray-600 hover:text-gray-800 select-none">
-										{selectedScript.jsScript
-											? `Script (${selectedScript.jsScript.split("\n").length} lines)${pendingApproval ? " - awaiting approval" : ""}`
-											: pendingApproval
-												? "Script (pending approval)"
-												: "No script yet"}
+									<summary className="cursor-pointer text-gray-600 hover:text-gray-800 select-none flex items-center justify-between">
+										<span>
+											{selectedScript.jsScript
+												? `Script (${selectedScript.jsScript.split("\n").length} lines)${pendingApproval ? " - awaiting approval" : ""}`
+												: pendingApproval
+													? "Script (pending approval)"
+													: "No script yet"}
+										</span>
+										{selectedScript.jsScript && (
+											<button
+												type="button"
+												onClick={(e) => {
+													e.preventDefault();
+													e.stopPropagation();
+													navigator.clipboard.writeText(
+														selectedScript.jsScript,
+													);
+												}}
+												className="px-1.5 py-0.5 text-[10px] bg-gray-100 text-gray-600 rounded hover:bg-gray-200"
+												title="Copy script to clipboard"
+											>
+												Copy
+											</button>
+										)}
 									</summary>
-									<textarea
-										value={selectedScript.jsScript}
-										onChange={(e) => {
-											selectedScript.jsScript = e.target.value;
-											setUserscripts([...userscripts]);
-										}}
-										onBlur={async () => {
-											selectedScript.updatedAt = Date.now();
-											await saveUserscript(selectedScript);
-											// Clear stale execution result since script changed
-											await clearExecutionResult(selectedScript.id);
-										}}
-										rows={8}
-										className="w-full mt-1 px-2 py-1 text-xs font-mono bg-white border border-gray-200 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
-										placeholder="// JavaScript code here..."
-									/>
+									<div className="mt-1">
+										<CodeEditor
+											value={selectedScript.jsScript}
+											onChange={(value) => {
+												selectedScript.jsScript = value;
+												setUserscripts([...userscripts]);
+											}}
+											onBlur={async () => {
+												selectedScript.updatedAt = Date.now();
+												await saveUserscript(selectedScript);
+												await clearExecutionResult(selectedScript.id);
+											}}
+											placeholder="// JavaScript code here..."
+										/>
+									</div>
 								</details>
 								{selectedScript.sourceUrl && (
 									<div className="text-[10px] text-gray-500">
@@ -2168,7 +2414,7 @@ ${el.outerHTML}`;
 										>
 											{selectedScript.sourceType === "greasyfork"
 												? "Greasyfork"
-												: selectedScript.sourceType === "openusersjs"
+												: selectedScript.sourceType === "openuserjs"
 													? "OpenUserJS"
 													: "external"}
 										</a>
@@ -2207,13 +2453,13 @@ ${el.outerHTML}`;
 														title="Click to expand/collapse"
 													>
 														{expandedSystemPrompt
-															? `You are an AI assistant that helps users create custom JavaScript code to modify web pages. You have two tools available:
+															? `You are an AI assistant that helps users create custom JavaScript jsScript to modify web pages. You have two tools available:
 
-1. execute_js(code: string) - Execute JavaScript code on the current page and see the output. Use this to test changes and explore the page structure.
+1. execute_js(jsScript: string) - Execute JavaScript jsScript on the current page and see the output. Use this to test changes and explore the page structure.
 2. submit_final_userscript(matchUrls: string, jsScript: string) - Submit the final userscript when ready. matchUrls should be a regex pattern matching the target URLs.
 
 After each execute_js call, ask the user if the changes look correct. If yes, save using submit_final_userscript. If no, continue iterating based on their feedback.`
-															: "You are an AI assistant that helps users create custom JavaScript code to modify web pages..."}
+															: "You are an AI assistant that helps users create custom JavaScript jsScript to modify web pages..."}
 													</div>
 												</div>
 												<div>
@@ -2247,13 +2493,18 @@ After each execute_js call, ask the user if the changes look correct. If yes, sa
 														</div>
 													</div>
 												)}
-												{currentChat.initialScreenshot && (
+												{(grabScreenshot || currentChat.initialScreenshot) && (
 													<div>
 														<div className="font-medium text-gray-600 mb-1">
 															Screenshot:
+															{grabScreenshot
+																? " (with selected elements)"
+																: ""}
 														</div>
 														<img
-															src={currentChat.initialScreenshot}
+															src={
+																grabScreenshot || currentChat.initialScreenshot
+															}
 															alt="Initial page"
 															className="max-w-full rounded border border-gray-300"
 														/>
@@ -2327,6 +2578,7 @@ After each execute_js call, ask the user if the changes look correct. If yes, sa
 															fill="none"
 															viewBox="0 0 24 24"
 															stroke="currentColor"
+															aria-hidden="true"
 														>
 															<path
 																strokeLinecap="round"
@@ -2348,6 +2600,7 @@ After each execute_js call, ask the user if the changes look correct. If yes, sa
 															fill="none"
 															viewBox="0 0 24 24"
 															stroke="currentColor"
+															aria-hidden="true"
 														>
 															<path
 																strokeLinecap="round"
@@ -2369,7 +2622,27 @@ After each execute_js call, ask the user if the changes look correct. If yes, sa
 												<div className="whitespace-pre-wrap">{msg.content}</div>
 												{msg.toolResults && (
 													<div className="mt-2 p-2 bg-black/10 rounded text-xs font-mono">
-														{msg.toolResults.map((r) => r.output).join("\n")}
+														{msg.toolResults
+															.map((r) => r.output)
+															.join("\n")
+															.split("\n")
+															.map((line, idx) => (
+																<div
+																	// biome-ignore lint/suspicious/noArrayIndexKey: diff lines are static
+																	key={idx}
+																	className={
+																		line.startsWith("-") &&
+																		line.includes("removed")
+																			? "text-red-600"
+																			: line.startsWith("+") &&
+																					line.includes("added")
+																				? "text-green-600"
+																				: "text-gray-500"
+																	}
+																>
+																	{line}
+																</div>
+															))}
 													</div>
 												)}
 											</div>
@@ -2386,7 +2659,21 @@ After each execute_js call, ask the user if the changes look correct. If yes, sa
 									Does this look correct?
 								</div>
 								<div className="text-xs bg-white p-2 rounded mb-3 font-mono max-h-32 overflow-y-auto">
-									{pendingApproval.output}
+									{pendingApproval.output.split("\n").map((line, idx) => (
+										<div
+											// biome-ignore lint/suspicious/noArrayIndexKey: diff lines are static
+											key={idx}
+											className={
+												line.startsWith("-") && line.includes("removed")
+													? "text-red-600"
+													: line.startsWith("+") && line.includes("added")
+														? "text-green-600"
+														: "text-gray-500"
+											}
+										>
+											{line}
+										</div>
+									))}
 								</div>
 								<input
 									type="text"
@@ -2441,12 +2728,19 @@ After each execute_js call, ask the user if the changes look correct. If yes, sa
 										Clear all
 									</button>
 								</div>
-								<div className="space-y-1 max-h-32 overflow-y-auto">
+								<div className="space-y-1 max-h-40 overflow-y-auto">
 									{grabbedElements.map((el) => (
 										<div
 											key={el.xpath}
 											className="flex items-center gap-2 p-2 bg-white rounded text-xs border border-violet-200"
 										>
+											{el.screenshot && (
+												<img
+													src={el.screenshot}
+													alt={`${el.tagName} element`}
+													className="w-16 h-12 object-contain bg-gray-100 rounded border border-violet-300 flex-shrink-0"
+												/>
+											)}
 											<div className="flex-1 min-w-0">
 												<div className="font-mono text-violet-900">
 													&lt;{el.tagName}
@@ -2510,13 +2804,13 @@ After each execute_js call, ask the user if the changes look correct. If yes, sa
 													: "bg-purple-500 animate-pulse"
 									}`}
 								/>
-								<span className="text-gray-600">
+								<span className="text-gray-600 font-mono">
 									{status === "IDLE"
 										? "Ready"
 										: status === "SENDING_TO_LLM"
-											? "Sending..."
+											? `Sending ${textTokensSent.toLocaleString()} tokens${imageSizeKb > 0 ? ` + ${imageSizeKb.toFixed(1)}kb img` : ""}...`
 											: status === "WAITING_FOR_LLM_RESPONSE"
-												? "Thinking..."
+												? `Thinking... ${elapsedSeconds}s${tokensReceived > 0 ? ` (~${tokensReceived.toLocaleString()} tokens)` : ""}`
 												: "Running JS..."}
 								</span>
 							</div>

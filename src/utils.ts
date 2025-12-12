@@ -1,4 +1,4 @@
-import type { AppState, ChatHistory, Userscript } from "./types";
+import type { ChatHistory, Userscript } from "./types";
 
 export const getCurrentTab = async () => {
 	const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -69,13 +69,18 @@ export const saveUserscript = async (userscript: Userscript): Promise<void> => {
 
 export const deleteUserscript = async (id: string): Promise<void> => {
 	const userscripts = await getUserscripts();
+	const userscriptToDelete = userscripts.find((u) => u.id === id);
 	const filtered = userscripts.filter((u) => u.id !== id);
 	await storage.set("userscripts", filtered);
 
-	// Also delete associated chat histories
-	const chatHistories = await getChatHistories();
-	const filteredChats = chatHistories.filter((c) => c.userscriptId !== id);
-	await storage.set("chatHistories", filteredChats);
+	// Also delete the associated chat history if it exists
+	if (userscriptToDelete?.chatHistoryId) {
+		const chatHistories = await getChatHistories();
+		const filteredChats = chatHistories.filter(
+			(c) => c.id !== userscriptToDelete.chatHistoryId,
+		);
+		await storage.set("chatHistories", filteredChats);
+	}
 };
 
 // Chat history storage

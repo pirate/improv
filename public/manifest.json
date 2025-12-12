@@ -28,7 +28,8 @@
     "sidePanel",
     "webNavigation",
     "userScripts",
-    "webRequest"
+    "webRequest",
+    "debugger"
   ],
   "host_permissions": [
     "<all_urls>"

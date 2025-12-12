@@ -1,9 +1,4 @@
-import type {
-	CapturePageDataResponse,
-	ExecuteJsResponse,
-	GrabbedElement,
-	Message,
-} from "./types";
+import type { CapturePageDataResponse, GrabbedElement, Message } from "./types";
 
 // Console log capture - limit to last 100 entries to prevent memory issues
 const consoleLogs: string[] = [];
@@ -291,7 +286,7 @@ function deactivateGrabMode() {
 	originalConsole.log("[Improv] Grab mode deactivated");
 }
 
-// Truncate high-entropy strings
+// Truncate high-entropy strings (base64 data, long random strings)
 const truncateHighEntropyStrings = (input: string): string => {
 	let result = input.replace(
 		/(data:[^;]+;base64,)[A-Za-z0-9+/]{100,}={0,2}/g,
@@ -301,154 +296,11 @@ const truncateHighEntropyStrings = (input: string): string => {
 	return result;
 };
 
-// Unique ID for communicating results from injected scripts
-const IMPROV_RESULT_EVENT = "improv-script-result";
-
-// Listen for results from injected scripts
-window.addEventListener(IMPROV_RESULT_EVENT, ((e: CustomEvent) => {
-	const { requestId, output, error } = e.detail;
-	// Store the result temporarily for the message handler to pick up
-	(window as unknown as Record<string, unknown>)[
-		`__improv_result_${requestId}`
-	] = { output, error };
-}) as EventListener);
-
-/**
- * Inject and execute JavaScript code by creating a <script> tag.
- * Uses a nonce if provided (from intercepted CSP headers) to bypass CSP.
- */
-function injectAndExecuteJs(
-	code: string,
-	requestId: string,
-	nonce?: string | null,
-): Promise<{ output: string; error?: string }> {
-	return new Promise((resolve) => {
-		// Wrap the code to capture console output and errors
-		const wrappedCode = `
-(function() {
-	const logs = [];
-	let scriptError = null;
-	
-	// Save original console methods
-	const origLog = console.log;
-	const origError = console.error;
-	const origWarn = console.warn;
-	const origInfo = console.info;
-	
-	// Override console methods
-	console.log = (...args) => {
-		origLog.apply(console, args);
-		try {
-			logs.push("[LOG] " + args.map(a => {
-				if (typeof a === "object") {
-					try { return JSON.stringify(a); } catch { return String(a); }
-				}
-				return String(a);
-			}).join(" "));
-		} catch {}
-	};
-	console.error = (...args) => {
-		origError.apply(console, args);
-		try { logs.push("[ERROR] " + args.map(a => String(a)).join(" ")); } catch {}
-	};
-	console.warn = (...args) => {
-		origWarn.apply(console, args);
-		try { logs.push("[WARN] " + args.map(a => String(a)).join(" ")); } catch {}
-	};
-	console.info = (...args) => {
-		origInfo.apply(console, args);
-		try { logs.push("[INFO] " + args.map(a => String(a)).join(" ")); } catch {}
-	};
-	
-	try {
-		${code}
-	} catch (e) {
-		scriptError = e instanceof Error ? e.message : String(e);
-		origError.call(console, "[Improv] Script error:", scriptError);
-	}
-	
-	// Restore console methods
-	console.log = origLog;
-	console.error = origError;
-	console.warn = origWarn;
-	console.info = origInfo;
-	
-	// Send result back via custom event
-	const output = logs.length > 0 
-		? logs.join("\\n") 
-		: scriptError ? "" : "Script executed successfully (no console output)";
-	
-	window.dispatchEvent(new CustomEvent("${IMPROV_RESULT_EVENT}", {
-		detail: { requestId: "${requestId}", output, error: scriptError }
-	}));
-})();
-`;
-
-		// Create and inject the script element
-		const scriptEl = document.createElement("script");
-		scriptEl.textContent = wrappedCode;
-
-		// Use the nonce from intercepted CSP headers if provided
-		if (nonce) {
-			scriptEl.setAttribute("nonce", nonce);
-			originalConsole.log(
-				"[Improv] Using CSP nonce from headers:",
-				nonce.slice(0, 8) + "...",
-			);
-		}
-
-		// Listen for the result
-		const resultKey = `__improv_result_${requestId}`;
-		const checkResult = () => {
-			const result = (window as unknown as Record<string, unknown>)[
-				resultKey
-			] as { output: string; error?: string } | undefined;
-			if (result) {
-				delete (window as unknown as Record<string, unknown>)[resultKey];
-				resolve(result);
-			} else {
-				// Script might have failed to execute at all (CSP blocked it)
-				resolve({
-					output: "",
-					error:
-						"Script injection blocked by CSP. The page may use a strict Content Security Policy that cannot be bypassed.",
-				});
-			}
-		};
-
-		// Inject the script
-		(document.head || document.documentElement).appendChild(scriptEl);
-		scriptEl.remove();
-
-		// Check for result after a short delay (script should execute synchronously)
-		setTimeout(checkResult, 50);
-	});
-}
-
 // Message handler
 chrome.runtime.onMessage.addListener(
 	(message: Message, sender, sendResponse) => {
 		if (message.type === "PING") {
 			sendResponse({ type: "PONG" });
-			return true;
-		}
-
-		// Handle code injection request from background script
-		if (message.type === "INJECT_AND_EXECUTE_JS") {
-			injectAndExecuteJs(message.code, message.requestId, message.nonce).then(
-				sendResponse,
-			);
-			return true; // Keep channel open for async response
-		}
-
-		// Legacy EXECUTE_JS handler (redirect to background)
-		if (message.type === "EXECUTE_JS") {
-			sendResponse({
-				type: "EXECUTE_JS_RESPONSE",
-				requestId: message.requestId,
-				result: "",
-				error: "EXECUTE_JS should be handled by background script",
-			});
 			return true;
 		}
 
@@ -472,13 +324,6 @@ chrome.runtime.onMessage.addListener(
 			return true;
 		}
 
-		// INJECT_USERSCRIPT is now handled by background.js using chrome.scripting.executeScript
-		// This bypasses CSP restrictions
-		if (message.type === "INJECT_USERSCRIPT") {
-			// No-op, background script handles this
-			return true;
-		}
-
 		// Grab mode message handlers
 		if (message.type === "GRAB_MODE_ACTIVATE") {
 			activateGrabMode();
@@ -493,10 +338,6 @@ chrome.runtime.onMessage.addListener(
 		}
 	},
 );
-
-// Userscript auto-execution is now handled by background.js
-// using chrome.webNavigation.onCompleted and chrome.scripting.executeScript
-// This bypasses CSP restrictions
 
 // Clean up grab mode if the page is navigated away
 window.addEventListener("beforeunload", () => {

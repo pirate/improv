@@ -1,15 +1,15 @@
 export interface Userscript {
 	id: string;
 	name: string;
-	matchUrls: string; // Regex pattern as string
-	jsScript: string;
-	chatHistoryId: string | null; // null if created manually, otherwise references the chat it came from
+	matchUrls: string; // Regex pattern for URL matching
+	jsScript: string; // JavaScript code
+	chatHistoryId: string; // References the chat history for this mod (1:1 relationship)
 	createdAt: number;
 	updatedAt: number;
 	enabled: boolean;
 	// Optional source attribution for imported scripts
 	sourceUrl?: string; // URL to the original script page (e.g., Greasyfork page)
-	sourceType?: "greasyfork" | "openusersjs" | "manual";
+	sourceType?: "greasyfork" | "openuserjs" | "manual";
 }
 
 // Script from a userscript repository (e.g., Greasyfork, OpenUserJS)
@@ -47,8 +47,8 @@ export interface ChatMessage {
 	timestamp: number;
 	toolCalls?: ToolCall[];
 	toolResults?: ToolResult[];
-	// Snapshot of the userscript state after this message was processed
-	// Only stored on user messages for revert functionality
+	// Snapshot of the userscript state BEFORE this message was sent
+	// Only stored on user messages for revert functionality (reverts to this state)
 	scriptSnapshot?: UserscriptSnapshot;
 }
 
@@ -68,9 +68,7 @@ export interface ToolResult {
 
 export interface ChatHistory {
 	id: string;
-	domain: string; // Domain of the page (e.g., "example.com")
-	apiUrl: string;
-	modelName: string;
+	domain: string; // Domain for quick filtering by current tab
 	messages: ChatMessage[];
 	initialPrompt: string;
 	initialUrl: string;
@@ -79,6 +77,11 @@ export interface ChatHistory {
 	initialConsoleLog: string;
 	createdAt: number;
 	updatedAt: number;
+	// Pending approval state - persisted per-chat so it survives tab changes/refreshes
+	pendingApproval?: {
+		jsScript: string;
+		output: string;
+	} | null;
 }
 
 export interface ExecuteJsRequest {
@@ -124,6 +127,7 @@ export interface GrabbedElement {
 	attributes: Record<string, string>;
 	textContent: string;
 	outerHTML: string; // Full HTML with only data URLs truncated
+	screenshot?: string; // Base64 screenshot of just this element
 }
 
 export interface GrabModeActivateRequest {
@@ -143,7 +147,7 @@ export interface GrabModeElementSelectedMessage {
 
 export interface GrabModeStateChangeMessage {
 	type: "GRAB_MODE_STATE_CHANGE";
-	isActive: boolean;
+	active: boolean;
 }
 
 export interface PingRequest {
@@ -166,12 +170,3 @@ export type Message =
 	| GrabModeStateChangeMessage
 	| PingRequest
 	| PongResponse;
-
-export interface AppState {
-	userscripts: Userscript[];
-	chatHistories: ChatHistory[];
-	currentChatId: string | null;
-	apiUrl: string;
-	apiKey: string;
-	modelName: string;
-}

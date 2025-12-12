@@ -5,6 +5,7 @@ import type {
 	ExecuteJsResponse,
 	GrabModeActivateRequest,
 	GrabModeDeactivateRequest,
+	GrabbedElement,
 	InjectUserscriptRequest,
 	Message,
 } from "./types";
@@ -118,6 +119,7 @@ async function configureUserScriptWorld() {
 		}
 
 		// Check if execute method exists (Chrome 135+)
+		// biome-ignore lint/suspicious/noExplicitAny: chrome.userScripts.execute() is Chrome 135+ API without types
 		if (typeof (chrome.userScripts as any).execute !== "function") {
 			console.warn(
 				"[Improv] chrome.userScripts.execute not available - need Chrome 135+",
@@ -241,6 +243,7 @@ chrome.webNavigation.onCompleted.addListener(async (details) => {
  * This bypasses CSP because USER_SCRIPT world is exempt from page CSP
  */
 async function executeUserScript(tabId: number, code: string): Promise<void> {
+	// biome-ignore lint/suspicious/noExplicitAny: chrome.userScripts.execute() is Chrome 135+ API without types
 	await (chrome.userScripts as any).execute({
 		target: { tabId },
 		js: [{ code }],
@@ -379,6 +382,7 @@ async function handleExecuteJs(
 `;
 
 		// Use chrome.userScripts.execute() - CSP exempt in USER_SCRIPT world
+		// biome-ignore lint/suspicious/noExplicitAny: chrome.userScripts.execute() is Chrome 135+ API without types
 		const results = await (chrome.userScripts as any).execute({
 			target: { tabId: request.tabId },
 			js: [{ code: wrappedCode }],
@@ -590,11 +594,14 @@ async function handleGrabModeDeactivate(
 }
 
 async function handleGrabModeElementSelected(
-	message: { type: string; element: unknown },
+	message: { type: string; element: GrabbedElement },
 	sender: chrome.runtime.MessageSender,
 ): Promise<void> {
+	const tabId = sender.tab?.id;
+	const element = message.element;
+
 	try {
-		// Capture screenshot while the purple highlight overlay is still visible
+		// Capture full page screenshot while the purple highlight overlay is still visible
 		let screenshot = "";
 		try {
 			screenshot = await chrome.tabs.captureVisibleTab(undefined, {
@@ -602,24 +609,146 @@ async function handleGrabModeElementSelected(
 			});
 		} catch (screenshotError) {
 			console.error("Failed to capture grab mode screenshot:", screenshotError);
-			// Continue without screenshot
 		}
 
-		// Send enhanced message with screenshot to sidepanel
+		// Capture element-specific screenshot using debugger API
+		let elementScreenshot = "";
+		if (tabId && element.xpath) {
+			try {
+				elementScreenshot = await captureElementScreenshot(
+					tabId,
+					element.xpath,
+				);
+			} catch (elemError) {
+				console.error("Failed to capture element screenshot:", elemError);
+			}
+		}
+
+		// Add element screenshot to the element data
+		const enhancedElement: GrabbedElement = {
+			...element,
+			screenshot: elementScreenshot,
+		};
+
+		// Send enhanced message with screenshots to sidepanel
 		chrome.runtime.sendMessage({
 			type: "GRAB_MODE_ELEMENT_SELECTED_WITH_SCREENSHOT",
-			element: message.element,
+			element: enhancedElement,
 			screenshot,
-			tabId: sender.tab?.id,
+			tabId,
 		});
 	} catch (error) {
 		console.error("Error handling grab mode element selection:", error);
-		// Still forward the original message without screenshot
+		// Still forward the original message without screenshots
 		chrome.runtime.sendMessage({
 			type: "GRAB_MODE_ELEMENT_SELECTED_WITH_SCREENSHOT",
-			element: message.element,
+			element,
 			screenshot: "",
-			tabId: sender.tab?.id,
+			tabId,
 		});
+	}
+}
+
+/**
+ * Capture a screenshot of a specific element using the Chrome Debugger API
+ */
+async function captureElementScreenshot(
+	tabId: number,
+	xpath: string,
+): Promise<string> {
+	const target = { tabId };
+
+	try {
+		// Attach debugger
+		await chrome.debugger.attach(target, "1.3");
+
+		// Enable required domains
+		await chrome.debugger.sendCommand(target, "DOM.enable");
+		await chrome.debugger.sendCommand(target, "Page.enable");
+
+		// Get document root
+		const docResult = (await chrome.debugger.sendCommand(
+			target,
+			"DOM.getDocument",
+		)) as { root: { nodeId: number } };
+
+		// Convert XPath to a CSS selector or use evaluate
+		// For XPath, we need to use DOM.performSearch or evaluate
+		const searchResult = (await chrome.debugger.sendCommand(
+			target,
+			"DOM.performSearch",
+			{ query: xpath },
+		)) as { searchId: string; resultCount: number };
+
+		if (searchResult.resultCount === 0) {
+			await chrome.debugger.detach(target);
+			return "";
+		}
+
+		// Get the node IDs from search
+		const nodeResults = (await chrome.debugger.sendCommand(
+			target,
+			"DOM.getSearchResults",
+			{
+				searchId: searchResult.searchId,
+				fromIndex: 0,
+				toIndex: 1,
+			},
+		)) as { nodeIds: number[] };
+
+		const nodeId = nodeResults.nodeIds[0];
+		if (!nodeId) {
+			await chrome.debugger.detach(target);
+			return "";
+		}
+
+		// Scroll element into view
+		await chrome.debugger.sendCommand(target, "DOM.scrollIntoViewIfNeeded", {
+			nodeId,
+		});
+
+		// Get box model for element bounds
+		const boxResult = (await chrome.debugger.sendCommand(
+			target,
+			"DOM.getBoxModel",
+			{ nodeId },
+		)) as { model: { border: number[] } };
+
+		const q = boxResult.model.border; // [x1,y1,x2,y2,x3,y3,x4,y4]
+		const xs = [q[0], q[2], q[4], q[6]];
+		const ys = [q[1], q[3], q[5], q[7]];
+		const x = Math.min(...xs);
+		const y = Math.min(...ys);
+		const width = Math.max(...xs) - x;
+		const height = Math.max(...ys) - y;
+
+		// Skip if element has no dimensions
+		if (width <= 0 || height <= 0) {
+			await chrome.debugger.detach(target);
+			return "";
+		}
+
+		// Capture screenshot of just the element
+		const screenshotResult = (await chrome.debugger.sendCommand(
+			target,
+			"Page.captureScreenshot",
+			{
+				format: "png",
+				clip: { x, y, width, height, scale: 1 },
+				captureBeyondViewport: true,
+			},
+		)) as { data: string };
+
+		await chrome.debugger.detach(target);
+
+		return `data:image/png;base64,${screenshotResult.data}`;
+	} catch (error) {
+		console.error("Failed to capture element screenshot:", error);
+		try {
+			await chrome.debugger.detach(target);
+		} catch {
+			// Ignore detach errors
+		}
+		return "";
 	}
 }

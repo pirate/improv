@@ -133,11 +133,3 @@ export function metadataToMatchRegex(metadata: UserscriptMetadata): string {
 
 	return `(${regexPatterns.join("|")})`;
 }
-
-/**
- * Extract meaningful URL patterns from script code for display/matching
- */
-export function extractUrlPatternsFromCode(code: string): string[] {
-	const metadata = parseUserscriptMetadata(code);
-	return [...metadata.match, ...metadata.include];
-}

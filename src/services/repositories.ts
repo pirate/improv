@@ -78,23 +78,6 @@ async function fetchGreasyforkScriptsInternal(
  */
 function parseOpenUserJSHtml(html: string): RepositoryScript[] {
 	const scripts: RepositoryScript[] = [];
-
-	// Match script panels - each script is in a panel with class "panel"
-	// The structure includes script name, author, description, installs, etc.
-	const scriptPanelRegex =
-		/<div[^>]*class="[^"]*panel[^"]*script-panel[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/g;
-
-	// Alternative: Look for script links and metadata
-	const scriptLinkRegex =
-		/<a[^>]*href="\/scripts\/([^/]+)\/([^"]+)"[^>]*class="[^"]*script-link[^"]*"[^>]*>([^<]+)<\/a>/g;
-
-	// Try to extract from list items
-	const listItemRegex =
-		/<tr[^>]*class="[^"]*script-list-item[^"]*"[^>]*>([\s\S]*?)<\/tr>/g;
-
-	let match: RegExpExecArray | null;
-
-	// Try script links pattern
 	const seenIds = new Set<string>();
 	const linkMatches = html.matchAll(
 		/<a[^>]*href="\/scripts\/([^/]+)\/([^"]+)"[^>]*>([^<]*)<\/a>/g,
@@ -231,16 +214,6 @@ export async function fetchRepositoryScripts(
 	scriptCache.set(cacheKey, { scripts, timestamp: Date.now() });
 
 	return scripts;
-}
-
-/**
- * Legacy function for backward compatibility
- * @deprecated Use fetchRepositoryScripts instead
- */
-export async function fetchGreasyforkScripts(
-	domain: string,
-): Promise<RepositoryScript[]> {
-	return fetchRepositoryScripts(domain);
 }
 
 /**

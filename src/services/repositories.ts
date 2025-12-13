@@ -220,12 +220,25 @@ export async function fetchRepositoryScripts(
  * Fetch the actual script code from a repository
  */
 export async function fetchScriptCode(codeUrl: string): Promise<string> {
-	const response = await fetch(codeUrl, {
-		headers: {
-			"User-Agent":
-				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-		},
-	});
+	if (!codeUrl) {
+		throw new Error("Script URL is missing or invalid");
+	}
+
+	let response: Response;
+	try {
+		response = await fetch(codeUrl, {
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+			},
+		});
+	} catch (fetchError) {
+		// Network errors, CORS issues, or invalid URLs
+		const message =
+			fetchError instanceof Error ? fetchError.message : String(fetchError);
+		throw new Error(`Network error fetching script: ${message}`);
+	}
+
 	if (!response.ok) {
 		throw new Error(
 			`Failed to fetch script code: ${response.status} ${response.statusText}`,

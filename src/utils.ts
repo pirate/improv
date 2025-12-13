@@ -153,6 +153,7 @@ export const saveSettings = async (settings: {
 	await storage.set("modelName", settings.modelName);
 };
 
+
 // Generate UUID v4
 export const generateUUID = (): string => {
 	return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {

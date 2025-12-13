@@ -501,8 +501,31 @@ export function App() {
 		const scripts = await getUserscripts();
 		const histories = await getChatHistories();
 
-		setUserscripts(scripts);
-		setChatHistories(histories);
+		// Data integrity: filter out invalid entries and orphaned data
+		const validHistories = histories.filter(
+			(h) => h && h.id && h.domain && typeof h.domain === "string",
+		);
+		const validHistoryIds = new Set(validHistories.map((h) => h.id));
+
+		// Filter out scripts with missing chatHistoryId or orphaned chat references
+		const validScripts = scripts.filter(
+			(s) => s && s.id && s.chatHistoryId && validHistoryIds.has(s.chatHistoryId),
+		);
+
+		// Log if we cleaned up any corrupt data (helpful for debugging)
+		if (validHistories.length !== histories.length) {
+			console.warn(
+				`Cleaned up ${histories.length - validHistories.length} invalid chat histories`,
+			);
+		}
+		if (validScripts.length !== scripts.length) {
+			console.warn(
+				`Cleaned up ${scripts.length - validScripts.length} orphaned/invalid userscripts`,
+			);
+		}
+
+		setUserscripts(validScripts);
+		setChatHistories(validHistories);
 		const settings = await getSettings();
 		setApiUrl(settings.apiUrl ?? "https://api.openai.com/v1/chat/completions");
 		setApiKey(settings.apiKey ?? "");
@@ -535,7 +558,7 @@ export function App() {
 				// Load fresh chat histories and find most recent for this domain
 				const histories = await getChatHistories();
 				const validHistories = histories.filter(
-					(h: Partial<ChatHistory>) => h.domain,
+					(h) => h && h.id && h.domain && typeof h.domain === "string",
 				);
 				setChatHistories(validHistories);
 
@@ -1506,8 +1529,8 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 	const handleImportScript = async (repoScript: RepositoryScript) => {
 		setImportingScriptId(repoScript.id);
 		try {
-			// Fetch the script jsScript
-			const jsScript = await fetchScriptCode(repoScript.jsScriptUrl);
+			// Fetch the script code
+			const jsScript = await fetchScriptCode(repoScript.codeUrl);
 
 			// Parse metadata from the script
 			const metadata = parseUserscriptMetadata(jsScript);

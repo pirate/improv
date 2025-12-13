@@ -864,6 +864,14 @@ ${currentScript.jsScript}
 
 After each execute_js call, ask the user if the changes look correct. If yes, save using submit_final_userscript. If no, continue iterating based on their feedback.
 
+IMPORTANT - Best practices for userscripts:
+- Always include a userscript-compatible header block at the top (// ==UserScript== ... // ==/UserScript==) with @name, @match, @description, etc.
+- NEVER attach MutationObservers to document.body or the entire DOM - only observe the specific elements you need to monitor
+- Follow performance best practices: don't block page rendering, avoid tight loops, minimize DOM queries, cache selectors
+- When adding new elements, visually match the style of surrounding elements (fonts, colors, spacing, etc.)
+- Use requestAnimationFrame or setTimeout for heavy operations to avoid freezing the page
+- Clean up event listeners and observers when no longer needed
+
 Current page URL: ${currentPageData.url || chat.initialUrl}
 ${currentScriptSection}
 ${htmlDescription}

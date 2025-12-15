@@ -134,12 +134,24 @@ export function App() {
 	const [apiKey, setApiKey] = useState("");
 	const [modelName, setModelName] = useState("gpt-5.2");
 
-	const [rejectionFeedback, setRejectionFeedback] = useState("");
 	const [status, setStatus] = useState<StatusState>("IDLE");
 	const [error, setError] = useState<string | null>(null);
-	// Live status counters
-	const [textTokensSent, setTextTokensSent] = useState(0);
-	const [imageSizeKb, setImageSizeKb] = useState(0);
+	// Live status counters - detailed breakdown
+	const [sendingStats, setSendingStats] = useState<{
+		htmlTokens: number;
+		promptTokens: number;
+		imageSizesKb: number[];
+		contextHtmlTokens: number;
+		contextPromptTokens: number;
+		contextImageSizesKb: number[];
+	}>({
+		htmlTokens: 0,
+		promptTokens: 0,
+		imageSizesKb: [],
+		contextHtmlTokens: 0,
+		contextPromptTokens: 0,
+		contextImageSizesKb: [],
+	});
 	const [tokensReceived, setTokensReceived] = useState(0);
 	const [elapsedSeconds, setElapsedSeconds] = useState(0);
 	const timerRef = useRef<NodeJS.Timeout | null>(null);
@@ -168,6 +180,12 @@ export function App() {
 	const editInputRef = useRef<HTMLTextAreaElement>(null);
 	// Abort controller for cancelling LLM requests
 	const abortControllerRef = useRef<AbortController | null>(null);
+	// Store generated titles per chat (chatId -> generated title)
+	const generatedTitlesRef = useRef<Record<string, string>>({});
+	// Track which scripts are currently generating titles
+	const [generatingTitleFor, setGeneratingTitleFor] = useState<Set<string>>(new Set());
+	// Track which messages have expanded grabbed elements
+	const [expandedGrabbedElements, setExpandedGrabbedElements] = useState<Set<string>>(new Set());
 	// Script execution results (scriptId -> { success, error?, timestamp })
 	const [scriptExecutionResults, setScriptExecutionResults] = useState<
 		Record<string, { success: boolean; error?: string; timestamp: number }>
@@ -176,9 +194,6 @@ export function App() {
 	const currentChat = currentChatId
 		? chatHistories.find((c) => c.id === currentChatId)
 		: null;
-
-	// Derive pendingApproval from current chat (persisted per-chat)
-	const pendingApproval = currentChat?.pendingApproval ?? null;
 
 	// Derive awaitingInitialPrompt from chat state (no messages yet means waiting for first prompt)
 	const awaitingInitialPrompt = currentChat
@@ -208,39 +223,330 @@ export function App() {
 		await chrome.storage.session.set({ scriptExecutionResults: results });
 	};
 
-	// Estimate token count and image size from request body
-	const estimateRequestStats = (
-		text: string,
-	): { textTokens: number; imageSizeKb: number } => {
-		// Extract base64 image data and calculate size
-		const base64Matches = text.match(
-			/data:image\/[^;]+;base64,([A-Za-z0-9+/=]+)/g,
-		);
-		let totalImageBytes = 0;
-		if (base64Matches) {
-			for (const fullMatch of base64Matches) {
-				// Extract just the base64 data part after the comma
-				const base64Data = fullMatch.split(",")[1] || "";
-				// Base64 encodes 3 bytes into 4 chars, so decode size = length * 3/4
-				totalImageBytes += Math.floor((base64Data.length * 3) / 4);
+	// Extract individual image sizes from text (returns array of sizes in KB)
+	const extractImageSizes = (text: string): number[] => {
+		if (!text) return [];
+		const sizes: number[] = [];
+
+		// Check if the whole string is a data URL
+		if (text.startsWith("data:image/")) {
+			const commaIndex = text.indexOf(",");
+			if (commaIndex > 0) {
+				const base64Data = text.slice(commaIndex + 1);
+				const bytes = Math.floor((base64Data.length * 3) / 4);
+				sizes.push(bytes / 1024);
+				return sizes;
 			}
 		}
-		const imageSizeKb = totalImageBytes / 1024;
 
-		// Text tokens: ~4 chars per token (excluding image data)
+		// Otherwise search for data URLs within the text
+		const regex = /data:image\/[^;]+;base64,([A-Za-z0-9+/=]+)/g;
+		let match;
+		while ((match = regex.exec(text)) !== null) {
+			const base64Data = match[1] || "";
+			const bytes = Math.floor((base64Data.length * 3) / 4);
+			sizes.push(bytes / 1024);
+		}
+		return sizes;
+	};
+
+	// Estimate tokens from text (excluding images)
+	const estimateTokens = (text: string): number => {
 		const textWithoutImages = text.replace(
 			/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/g,
 			"",
 		);
-		const textTokens = Math.ceil(textWithoutImages.length / 4);
+		return Math.ceil(textWithoutImages.length / 4);
+	};
 
-		return { textTokens, imageSizeKb };
+	// Extract text and images from message content (handles both string and array formats)
+	const extractMessageContent = (content: string | unknown[]): { text: string; imageUrls: string[] } => {
+		if (typeof content === "string") {
+			return { text: content, imageUrls: [] };
+		}
+		// Array format: [{ type: "text", text: "..." }, { type: "image_url", image_url: { url: "..." } }]
+		let text = "";
+		const imageUrls: string[] = [];
+		for (const item of content as Array<{ type: string; text?: string; image_url?: { url: string } }>) {
+			if (item.type === "text" && item.text) {
+				text += item.text + "\n";
+			} else if (item.type === "image_url" && item.image_url?.url) {
+				imageUrls.push(item.image_url.url);
+			}
+		}
+		return { text, imageUrls };
+	};
+
+	// Estimate detailed stats from messages array
+	// Returns "new" stats (what's being added) and "total" stats (everything)
+	const estimateDetailedStats = (
+		messages: Array<{ role: string; content: string | unknown[] }>,
+	): {
+		htmlTokens: number;      // NEW html tokens (only in current message)
+		promptTokens: number;    // NEW prompt tokens (only in current message)
+		imageSizesKb: number[];  // NEW images (only in current message)
+		contextHtmlTokens: number;      // TOTAL html tokens (all messages)
+		contextPromptTokens: number;    // TOTAL prompt tokens (all messages)
+		contextImageSizesKb: number[];  // TOTAL images (all messages)
+	} => {
+		// Count user messages to determine if this is the first message
+		const userMessageCount = messages.filter(m => m.role === "user").length;
+		const isFirstMessage = userMessageCount <= 1;
+
+		// "New" = only the last user message (for follow-ups) or everything (for first message)
+		let newHtmlTokens = 0;
+		let newPromptTokens = 0;
+		const newImageSizesKb: number[] = [];
+
+		// "Total" = everything being sent
+		let totalHtmlTokens = 0;
+		let totalPromptTokens = 0;
+		const totalImageSizesKb: number[] = [];
+
+		for (let i = 0; i < messages.length; i++) {
+			const msg = messages[i];
+			const { text: textContent, imageUrls } = extractMessageContent(msg.content);
+
+			const isLastUserMessage = i === messages.length - 1 && msg.role === "user";
+			const isSystemMessage = msg.role === "system";
+
+			// Extract image sizes from URLs
+			const imgSizes: number[] = [];
+			for (const url of imageUrls) {
+				const sizes = extractImageSizes(url);
+				imgSizes.push(...sizes);
+			}
+			// Also check for inline images in text content
+			imgSizes.push(...extractImageSizes(textContent));
+
+			// Estimate text tokens
+			const tokens = estimateTokens(textContent);
+
+			// Calculate HTML vs prompt tokens for this message
+			let htmlToks = 0;
+			let promptToks = tokens;
+
+			if (isSystemMessage) {
+				// System message contains HTML - try to separate HTML from the rest
+				const htmlMatch = textContent.match(/Current page (DOM structure|HTML)[^:]*:\s*([\s\S]*?)(\n\nRecent console logs:|$)/);
+				if (htmlMatch) {
+					const htmlPart = htmlMatch[2] || "";
+					htmlToks = Math.ceil(htmlPart.length / 4);
+					promptToks = tokens - htmlToks;
+				}
+			} else {
+				// Check if content has HTML snippets (from grabbed elements)
+				const htmlSnippetMatches = textContent.match(/HTML:\s*\n([\s\S]*?)(?=\n---|$)/g);
+				if (htmlSnippetMatches) {
+					for (const snippet of htmlSnippetMatches) {
+						htmlToks += Math.ceil(snippet.length / 4);
+					}
+					promptToks = tokens - htmlToks;
+				}
+			}
+
+			// Always add to totals
+			totalHtmlTokens += htmlToks;
+			totalPromptTokens += promptToks;
+			totalImageSizesKb.push(...imgSizes);
+
+			// Add to "new" only if this is part of the new content
+			// For first message: everything is new
+			// For follow-ups: only the last user message is new
+			const isNewContent = isFirstMessage || isLastUserMessage;
+			if (isNewContent) {
+				newHtmlTokens += htmlToks;
+				newPromptTokens += promptToks;
+				newImageSizesKb.push(...imgSizes);
+			}
+		}
+
+		return {
+			htmlTokens: newHtmlTokens,
+			promptTokens: newPromptTokens,
+			imageSizesKb: newImageSizesKb,
+			contextHtmlTokens: totalHtmlTokens,
+			contextPromptTokens: totalPromptTokens,
+			contextImageSizesKb: totalImageSizesKb,
+		};
 	};
 
 	// Estimate tokens from response text
 	const estimateResponseTokens = (text: string): number => {
 		return Math.ceil(text.length / 4);
 	};
+
+	// Format image sizes as individual icons
+	const formatImages = (sizes: number[]): string => {
+		if (sizes.length === 0) return "";
+		return sizes.map(size => `${Math.round(size)}kb 🖼️`).join(" ");
+	};
+
+	// Format total stats for display (always shown on right side)
+	const formatContextStats = (): string => {
+		const { contextHtmlTokens, contextPromptTokens, contextImageSizesKb } = sendingStats;
+
+		if (contextHtmlTokens === 0 && contextPromptTokens === 0 && contextImageSizesKb.length === 0) {
+			return "";
+		}
+
+		const parts: string[] = [];
+		if (contextHtmlTokens > 0) {
+			parts.push(`${contextHtmlTokens.toLocaleString()} 📄`);
+		}
+		if (contextPromptTokens > 0) {
+			parts.push(`${contextPromptTokens.toLocaleString()} ✍️`);
+		}
+		if (contextImageSizesKb.length > 0) {
+			parts.push(formatImages(contextImageSizesKb));
+		}
+
+		return parts.join("  ");
+	};
+
+	// Format sending stats for display (shown while sending) - just the new message
+	const formatSendingStats = (): string => {
+		const { htmlTokens, promptTokens, imageSizesKb, contextHtmlTokens, contextPromptTokens } = sendingStats;
+
+		const parts: string[] = [];
+		if (htmlTokens > 0) {
+			parts.push(`${htmlTokens.toLocaleString()} 📄`);
+		}
+		if (promptTokens > 0) {
+			parts.push(`${promptTokens.toLocaleString()} ✍️`);
+		}
+		if (imageSizesKb.length > 0) {
+			parts.push(formatImages(imageSizesKb));
+		}
+
+		const display = parts.join("  ");
+		return `⤴ ${display || "..."}`;
+	};
+
+	// Build messages array for LLM - used for both sending and stats calculation
+	type MessageContent = string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
+	type LLMMessage = { role: string; content: MessageContent; tool_calls?: unknown[]; tool_call_id?: string };
+
+	const buildMessagesForLLM = useCallback((
+		chat: ChatHistory,
+		currentScript: Userscript | undefined,
+		currentPageUrl: string,
+	): LLMMessage[] => {
+		const messages: LLMMessage[] = [];
+
+		// Prepare HTML for LLM
+		const { content: htmlContent, isShallow } = prepareHtmlForLLM(chat.initialHtml || "");
+		const htmlDescription = isShallow
+			? "Current page DOM structure (simplified tree representation due to page size):"
+			: "Current page HTML (high-entropy strings like data URLs have been truncated):";
+
+		const currentScriptSection = currentScript?.jsScript
+			? `\nCurrent userscript (edit this to make changes):\n\`\`\`javascript\n${currentScript.jsScript}\n\`\`\`\n`
+			: "\nNo userscript exists yet - create a new one.";
+
+		// System message
+		messages.push({
+			role: "system",
+			content: `You are an AI assistant that helps users create custom JavaScript userscripts to modify web pages. You have one tool available:
+
+execute_js(jsScript: string) - Execute JavaScript on the current page. The page will be refreshed and the script will run automatically. The script is saved after each execution, so just keep iterating based on user feedback.
+
+IMPORTANT - Best practices for userscripts:
+- Always include a userscript-compatible header block at the top (// ==UserScript== ... // ==/UserScript==) with @name, @match, @description, etc.
+- NEVER attach MutationObservers to document.body or the entire DOM - only observe the specific elements you need to monitor
+- Follow performance best practices: don't block page rendering, avoid tight loops, minimize DOM queries, cache selectors
+- When adding new elements, visually match the style of surrounding elements (fonts, colors, spacing, etc.)
+- Use requestAnimationFrame or setTimeout for heavy operations to avoid freezing the page
+- Clean up event listeners and observers when no longer needed
+
+Current page URL: ${currentPageUrl || chat.initialUrl || ""}
+${currentScriptSection}
+${htmlDescription}
+${htmlContent}
+
+Recent console logs:
+${(chat.initialConsoleLog || "").slice(0, 10000)}`,
+		});
+
+		// Add conversation history with screenshots preserved
+		let isFirstUserMessage = true;
+		for (const msg of chat.messages) {
+			if (msg.role === "user") {
+				const hasGrabbedScreenshots = msg.grabbedElements?.some(el => el.screenshot);
+				// First user message gets the page screenshot (if available)
+				const includePageScreenshot = isFirstUserMessage && chat.initialScreenshot;
+				isFirstUserMessage = false;
+
+				if (hasGrabbedScreenshots || includePageScreenshot) {
+					const content: Array<{ type: string; text?: string; image_url?: { url: string } }> = [
+						{ type: "text", text: msg.content },
+					];
+					// Add page screenshot for first message
+					if (includePageScreenshot) {
+						content.push({ type: "image_url", image_url: { url: chat.initialScreenshot } });
+					}
+					// Add grabbed element screenshots
+					for (const el of msg.grabbedElements || []) {
+						if (el.screenshot) {
+							content.push({
+								type: "text",
+								text: `\nScreenshot of selected element (${el.tagName}, xpath: ${el.xpath}):`,
+							});
+							content.push({
+								type: "image_url",
+								image_url: { url: el.screenshot },
+							});
+						}
+					}
+					messages.push({ role: "user", content });
+				} else {
+					messages.push({ role: "user", content: msg.content });
+				}
+			} else if (msg.role === "assistant") {
+				const assistantMsg: LLMMessage = { role: "assistant", content: msg.content };
+				if (msg.toolCalls) {
+					assistantMsg.tool_calls = msg.toolCalls.map((tc) => ({
+						id: tc.id,
+						type: tc.type,
+						function: { name: tc.function.name, arguments: tc.function.arguments },
+					}));
+				}
+				messages.push(assistantMsg);
+			}
+			// Add tool results
+			if (msg.toolResults) {
+				for (const result of msg.toolResults) {
+					messages.push({
+						role: "tool",
+						tool_call_id: result.toolCallId,
+						content: result.output,
+					});
+				}
+			}
+		}
+
+		return messages;
+	}, []);
+
+	// Calculate stats from chat by building the actual messages that would be sent
+	const calculateStatsFromChatHistory = useCallback((chat: ChatHistory | null) => {
+		if (!chat) {
+			setSendingStats({
+				htmlTokens: 0,
+				promptTokens: 0,
+				imageSizesKb: [],
+				contextHtmlTokens: 0,
+				contextPromptTokens: 0,
+				contextImageSizesKb: [],
+			});
+			return;
+		}
+
+		const script = userscripts.find(s => s.chatHistoryId === chat.id);
+		const messages = buildMessagesForLLM(chat, script, currentUrl);
+		const stats = estimateDetailedStats(messages);
+		setSendingStats(stats);
+	}, [buildMessagesForLLM, userscripts, currentUrl]);
 
 	// Start/stop elapsed timer
 	const startTimer = useCallback(() => {
@@ -257,18 +563,77 @@ export function App() {
 		}
 	}, []);
 
-	// Helper to update pendingApproval on a chat (persisted per-chat)
-	const setPendingApproval = async (
+	// Generate a short title (2-4 words) from a prompt using LLM
+	const generateModTitle = async (
 		chatId: string,
-		value: { jsScript: string; output: string } | null,
+		prompt: string,
+		scriptId: string,
+		forceUpdate = false,
 	) => {
-		const chat = chatHistories.find((c) => c.id === chatId);
-		if (!chat) return;
+		if (!apiKey || !apiUrl) return;
 
-		chat.pendingApproval = value;
-		chat.updatedAt = Date.now();
-		await saveChatHistory(chat);
-		setChatHistories([...chatHistories]);
+		// Mark as generating
+		setGeneratingTitleFor((prev) => new Set(prev).add(scriptId));
+
+		try {
+			const response = await fetch(apiUrl, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${apiKey}`,
+				},
+				body: JSON.stringify({
+					model: "gpt-4.1-mini",
+					messages: [
+						{
+							role: "system",
+							content:
+								"You are a helpful assistant that creates short, descriptive titles. Respond with ONLY the title, nothing else.",
+						},
+						{
+							role: "user",
+							content: `Create a short title (2-4 words) that summarizes this request for a browser userscript. The title should describe what the script does. Do not use quotes or punctuation.\n\nRequest: ${prompt}`,
+						},
+					],
+					max_tokens: 20,
+				}),
+			});
+
+			if (!response.ok) {
+				const errorText = await response.text();
+				console.error("Title generation failed:", response.status, errorText);
+				return;
+			}
+
+			const data = await response.json();
+			const title = data.choices?.[0]?.message?.content?.trim();
+
+			if (title && title.length > 0 && title.length <= 50) {
+				// Store the generated title
+				generatedTitlesRef.current[chatId] = title;
+
+				// Update the userscript name
+				setUserscripts((currentScripts) => {
+					const script = currentScripts.find((s) => s.id === scriptId);
+					if (script && (forceUpdate || script.name.startsWith("New Script for "))) {
+						script.name = title;
+						script.updatedAt = Date.now();
+						saveUserscript(script);
+						return [...currentScripts];
+					}
+					return currentScripts;
+				});
+			}
+		} catch (err) {
+			console.error("Title generation error:", err);
+		} finally {
+			// Clear generating state
+			setGeneratingTitleFor((prev) => {
+				const next = new Set(prev);
+				next.delete(scriptId);
+				return next;
+			});
+		}
 	};
 
 	useEffect(() => {
@@ -337,18 +702,33 @@ export function App() {
 				.filter((chat) => chat.domain === domain)
 				.sort((a, b) => b.updatedAt - a.updatedAt);
 
-			// Check if current chat is valid for this domain
-			const currentChatIsValid =
+			// Check if current chat exists in ANY domain's chats (might be newly created for different domain)
+			const currentChatExists =
+				currentChatId &&
+				chatHistories.some((chat) => chat.id === currentChatId);
+
+			// Check if current chat is valid for THIS domain
+			const currentChatIsValidForDomain =
 				currentChatId && domainChats.some((chat) => chat.id === currentChatId);
 
-			// If we don't have a valid current chat for this domain, select most recent
-			if (!currentChatIsValid) {
+			// Only auto-select if we don't have a valid current chat at all,
+			// OR if the current chat exists but isn't for this domain (user navigated away)
+			if (!currentChatExists) {
+				// No current chat selected, pick most recent for this domain
+				if (domainChats.length > 0) {
+					setCurrentChatId(domainChats[0].id);
+				} else {
+					setCurrentChatId(null);
+				}
+			} else if (currentChatExists && !currentChatIsValidForDomain) {
+				// Current chat is for a different domain, switch to this domain's most recent
 				if (domainChats.length > 0) {
 					setCurrentChatId(domainChats[0].id);
 				} else {
 					setCurrentChatId(null);
 				}
 			}
+			// If currentChatExists && currentChatIsValidForDomain, keep the current selection
 		} else if (!currentUrl || !domain) {
 			// No valid URL/domain, clear chat
 			setCurrentChatId(null);
@@ -361,6 +741,13 @@ export function App() {
 		setExpandedSystemPrompt(false);
 		setExpandedHtml(false);
 	}, [currentChatId]);
+
+	// Calculate context stats when viewing a chat
+	useEffect(() => {
+		if (currentChat && status === "IDLE") {
+			calculateStatsFromChatHistory(currentChat);
+		}
+	}, [currentChatId, currentChat?.messages.length, status, calculateStatsFromChatHistory]);
 
 	// Fetch repository scripts when domain changes
 	useEffect(() => {
@@ -548,9 +935,7 @@ export function App() {
 
 			// If domain changed, update the UI
 			if (newDomain !== oldDomain) {
-				// Clear UI state
 				// Clear transient UI state on domain change
-				// Note: pendingApproval is per-chat and persisted, no need to clear
 				setError(null);
 				setExpandedSystemPrompt(false);
 				setExpandedHtml(false);
@@ -790,8 +1175,15 @@ export function App() {
 		if (!chat || !currentTabId) return;
 
 		// If this is the initial prompt (first message), save it to the chat
-		if (!chat.initialPrompt && chat.messages.length === 0) {
+		const isFirstMessage = !chat.initialPrompt && chat.messages.length === 0;
+		if (isFirstMessage) {
 			chat.initialPrompt = userMessage;
+
+			// Generate a short title in parallel (non-blocking)
+			const script = userscripts.find((s) => s.chatHistoryId === chatId);
+			if (script && script.name.startsWith("New Script for ")) {
+				generateModTitle(chatId, userMessage, script.id);
+			}
 		}
 
 		setStatus("SENDING_TO_LLM");
@@ -819,13 +1211,14 @@ export function App() {
 				}
 			: undefined;
 
-		// Add user message with script snapshot
+		// Add user message with script snapshot and grabbed elements
 		const userMsg: ChatMessage = {
 			id: generateUUID(),
 			role: "user",
 			content: userMessage,
 			timestamp: Date.now(),
 			scriptSnapshot,
+			grabbedElements: elementsWithScreenshots,
 		};
 
 		chat.messages.push(userMsg);
@@ -833,181 +1226,8 @@ export function App() {
 		await saveChatHistory(chat);
 		setChatHistories([...chatHistories]);
 
-		// Prepare messages for API
-		const messages = [];
-
-		// Prepare HTML for LLM (uses shallow DOM tree for large pages)
-		const { content: htmlContent, isShallow } = prepareHtmlForLLM(
-			currentPageData.html,
-		);
-
-		// System message with current page state
-		const htmlDescription = isShallow
-			? "Current page DOM structure (simplified tree representation due to page size):"
-			: "Current page HTML (high-entropy strings like data URLs have been truncated):";
-
-		// Include current script in the prompt so LLM knows what to edit
-		const currentScriptSection = currentScript?.jsScript
-			? `\nCurrent userscript (edit this to make changes):
-\`\`\`javascript
-${currentScript.jsScript}
-\`\`\`
-`
-			: "\nNo userscript exists yet - create a new one.";
-
-		messages.push({
-			role: "system",
-			content: `You are an AI assistant that helps users create custom JavaScript userscripts to modify web pages. You have two tools available:
-
-1. execute_js(jsScript: string) - Execute JavaScript on the current page and see the output. The page will be refreshed and the script will run. Use this to test changes.
-2. submit_final_userscript(matchUrls: string, jsScript: string) - Submit the final userscript when ready. matchUrls should be a regex pattern matching the target URLs.
-
-After each execute_js call, ask the user if the changes look correct. If yes, save using submit_final_userscript. If no, continue iterating based on their feedback.
-
-IMPORTANT - Best practices for userscripts:
-- Always include a userscript-compatible header block at the top (// ==UserScript== ... // ==/UserScript==) with @name, @match, @description, etc.
-- NEVER attach MutationObservers to document.body or the entire DOM - only observe the specific elements you need to monitor
-- Follow performance best practices: don't block page rendering, avoid tight loops, minimize DOM queries, cache selectors
-- When adding new elements, visually match the style of surrounding elements (fonts, colors, spacing, etc.)
-- Use requestAnimationFrame or setTimeout for heavy operations to avoid freezing the page
-- Clean up event listeners and observers when no longer needed
-
-Current page URL: ${currentPageData.url || chat.initialUrl}
-${currentScriptSection}
-${htmlDescription}
-${htmlContent}
-
-Recent console logs:
-${currentPageData.consoleLog.slice(0, 10000)}`,
-		});
-
-		// Use grab screenshot if available (shows highlighted elements), otherwise use current page screenshot
-		const screenshotToUse = grabScreenshot || currentPageData.screenshot;
-
-		// Check if we have element screenshots to include
-		const hasElementScreenshots = elementsWithScreenshots?.some(
-			(el) => el.screenshot,
-		);
-
-		// Add initial context if this is the first message (with screenshot)
-		if (
-			chat.messages.length === 1 &&
-			(screenshotToUse || hasElementScreenshots)
-		) {
-			const content: (
-				| { type: "text"; text: string }
-				| { type: "image_url"; image_url: { url: string } }
-			)[] = [
-				{
-					type: "text",
-					text: `User request: ${userMessage}${grabScreenshot ? "\n\n(Full page screenshot shows the element(s) I selected highlighted in purple)" : ""}`,
-				},
-			];
-
-			// Add full page screenshot
-			if (screenshotToUse) {
-				content.push({
-					type: "image_url",
-					image_url: {
-						url: screenshotToUse,
-					},
-				});
-			}
-
-			// Add individual element screenshots
-			if (elementsWithScreenshots) {
-				for (const el of elementsWithScreenshots) {
-					if (el.screenshot) {
-						content.push({
-							type: "text",
-							text: `\nScreenshot of selected element (${el.tagName}, xpath: ${el.xpath}):`,
-						});
-						content.push({
-							type: "image_url",
-							image_url: {
-								url: el.screenshot,
-							},
-						});
-					}
-				}
-			}
-
-			messages.push({
-				role: "user",
-				content,
-			});
-		} else if (hasElementScreenshots) {
-			// Not first message but has element screenshots - add them with the user message
-			const content: (
-				| { type: "text"; text: string }
-				| { type: "image_url"; image_url: { url: string } }
-			)[] = [
-				{
-					type: "text",
-					text: userMessage,
-				},
-			];
-
-			// Add individual element screenshots
-			for (const el of elementsWithScreenshots || []) {
-				if (el.screenshot) {
-					content.push({
-						type: "text",
-						text: `\nScreenshot of selected element (${el.tagName}, xpath: ${el.xpath}):`,
-					});
-					content.push({
-						type: "image_url",
-						image_url: {
-							url: el.screenshot,
-						},
-					});
-				}
-			}
-
-			messages.push({
-				role: "user",
-				content,
-			});
-		} else {
-			// Add conversation history
-			for (const msg of chat.messages) {
-				if (msg.role === "user" && msg !== userMsg) {
-					messages.push({ role: "user", content: msg.content });
-				} else if (msg.role === "assistant") {
-					const assistantMsg: {
-						role: string;
-						content: string;
-						tool_calls?: {
-							id: string;
-							type: string;
-							function: { name: string; arguments: string };
-						}[];
-					} = { role: "assistant", content: msg.content };
-					if (msg.toolCalls) {
-						assistantMsg.tool_calls = msg.toolCalls.map((tc) => ({
-							id: tc.id,
-							type: tc.type,
-							function: {
-								name: tc.function.name,
-								arguments: tc.function.arguments,
-							},
-						}));
-					}
-					messages.push(assistantMsg);
-				}
-				// Add tool results
-				if (msg.toolResults) {
-					for (const result of msg.toolResults) {
-						messages.push({
-							role: "tool",
-							tool_call_id: result.toolCallId,
-							content: result.output,
-						});
-					}
-				}
-			}
-			messages.push({ role: "user", content: userMessage });
-		}
+		// Build messages using shared function (ensures consistency between sending and stats)
+		const messages = buildMessagesForLLM(chat, currentScript, currentPageData.url);
 
 		// Call OpenAI API
 		try {
@@ -1037,37 +1257,12 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 							},
 						},
 					},
-					{
-						type: "function",
-						function: {
-							name: "submit_final_userscript",
-							description:
-								"Submit the final userscript when the changes are approved by the user",
-							parameters: {
-								type: "object",
-								properties: {
-									matchUrls: {
-										type: "string",
-										description:
-											"Regex pattern for matching URLs where this script should run",
-									},
-									jsScript: {
-										type: "string",
-										description:
-											"The final JavaScript jsScript for the userscript",
-									},
-								},
-								required: ["matchUrls", "jsScript"],
-							},
-						},
-					},
 				],
 			});
 
 			// Estimate and show tokens/image size being sent
-			const stats = estimateRequestStats(requestBody);
-			setTextTokensSent(stats.textTokens);
-			setImageSizeKb(stats.imageSizeKb);
+			const stats = estimateDetailedStats(messages);
+			setSendingStats(stats);
 			setTokensReceived(0);
 			setStatus("SENDING_TO_LLM");
 
@@ -1204,15 +1399,6 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 							? `-${removed} lines removed\n+${added} lines added\n(page refreshed)`
 							: `+${newLines} lines added\n(page refreshed)`;
 
-						// Set pending approval
-						console.log("[Improv] Setting pendingApproval:", {
-							jsScript: newScript.slice(0, 100),
-						});
-						await setPendingApproval(chatId, {
-							jsScript: newScript,
-							output: diffSummary,
-						});
-
 						// Add assistant message with tool call
 						const assistantMsg: ChatMessage = {
 							id: generateUUID(),
@@ -1243,62 +1429,6 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 
 						chat.messages.push(assistantMsg);
 						chat.updatedAt = Date.now();
-						await saveChatHistory(chat);
-						setChatHistories([...chatHistories]);
-						setStatus("IDLE");
-						return;
-					}
-					if (toolCall.function.name === "submit_final_userscript") {
-						const args = JSON.parse(toolCall.function.arguments);
-
-						// Find existing userscript for this chat (created in handleNewChat)
-						const existingScript = userscripts.find(
-							(s) => s.chatHistoryId === chatId,
-						);
-
-						let updatedScript: Userscript;
-						if (existingScript) {
-							// Update existing userscript with LLM's jsScript
-							existingScript.matchUrls = args.matchUrls;
-							existingScript.jsScript = args.jsScript;
-							existingScript.name =
-								chat.initialPrompt?.slice(0, 100) ||
-								`Script for ${new URL(chat.initialUrl).hostname}`;
-							existingScript.enabled = true; // Enable now that it has jsScript
-							existingScript.updatedAt = Date.now();
-							updatedScript = existingScript;
-
-							await saveUserscript(existingScript);
-							setUserscripts([...userscripts]);
-						} else {
-							// Fallback: create new userscript if somehow it doesn't exist
-							const scriptId = generateUUID();
-							updatedScript = {
-								id: scriptId,
-								name:
-									chat.initialPrompt?.slice(0, 100) ||
-									`Script for ${new URL(chat.initialUrl).hostname}`,
-								matchUrls: args.matchUrls,
-								jsScript: args.jsScript,
-								chatHistoryId: chatId,
-								createdAt: Date.now(),
-								updatedAt: Date.now(),
-								enabled: true,
-							};
-
-							await saveUserscript(updatedScript);
-							setUserscripts([...userscripts, updatedScript]);
-						}
-
-						// Add success message
-						const successMsg: ChatMessage = {
-							id: generateUUID(),
-							role: "assistant",
-							content:
-								"Userscript saved! It will now run automatically on matching pages.",
-							timestamp: Date.now(),
-						};
-						chat.messages.push(successMsg);
 						await saveChatHistory(chat);
 						setChatHistories([...chatHistories]);
 						setStatus("IDLE");
@@ -1363,99 +1493,6 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 			setStatus("IDLE");
 		} finally {
 			abortControllerRef.current = null;
-		}
-	};
-
-	const handleApprove = async () => {
-		if (!currentChatId || !pendingApproval) return;
-
-		const chat = chatHistories.find((c) => c.id === currentChatId);
-		if (!chat) return;
-
-		// Script is already saved as draft from execute_js, just enable it
-		const existingScript = userscripts.find(
-			(s) => s.chatHistoryId === currentChatId,
-		);
-
-		if (existingScript) {
-			// Enable the script and update name if needed
-			existingScript.name =
-				chat.initialPrompt?.slice(0, 100) ||
-				`Script for ${getDomainFromUrl(chat.initialUrl)}`;
-			existingScript.enabled = true;
-			existingScript.updatedAt = Date.now();
-
-			await saveUserscript(existingScript);
-			setUserscripts([...userscripts]);
-		}
-
-		// Add a confirmation message to the chat
-		const confirmMsg: ChatMessage = {
-			id: generateUUID(),
-			role: "assistant",
-			content:
-				"Userscript finalized! It will now run automatically on matching pages.",
-			timestamp: Date.now(),
-		};
-		chat.messages.push(confirmMsg);
-		chat.pendingApproval = null; // Clear pending approval
-		chat.updatedAt = Date.now();
-		await saveChatHistory(chat);
-		setChatHistories([...chatHistories]);
-	};
-
-	const handleReject = async (action: "continue" | "refresh") => {
-		if (!currentChatId) return;
-		const feedback = rejectionFeedback.trim();
-		await setPendingApproval(currentChatId, null);
-		setRejectionFeedback("");
-
-		if (action === "continue" && currentChatId) {
-			// Keep iterating - send feedback to LLM to refine the draft
-			const grabbedContext = formatGrabbedElementsForPrompt();
-			let message = feedback
-				? feedback
-				: "That didn't work as expected. Please try a different approach.";
-
-			// Include any grabbed elements selected during feedback
-			if (grabbedContext) {
-				message += `\n\nHere are the elements I selected:${grabbedContext}`;
-			}
-
-			// Pass grabbed elements with their screenshots
-			const elementsToSend =
-				grabbedElements.length > 0 ? [...grabbedElements] : undefined;
-			await sendMessageToLLM(currentChatId, message, undefined, elementsToSend);
-
-			// Clear grabbed elements after sending
-			setGrabbedElements([]);
-			setGrabScreenshot(null);
-		} else if (action === "refresh" && currentChatId) {
-			// Start over - clear chat messages and reset script draft
-			const chat = chatHistories.find((c) => c.id === currentChatId);
-			const script = userscripts.find((s) => s.chatHistoryId === currentChatId);
-
-			if (chat) {
-				chat.messages = [];
-				chat.updatedAt = Date.now();
-				await saveChatHistory(chat);
-				setChatHistories([...chatHistories]);
-			}
-
-			// Clear the script draft
-			if (script) {
-				script.jsScript = "";
-				script.enabled = false;
-				script.updatedAt = Date.now();
-				await saveUserscript(script);
-				setUserscripts([...userscripts]);
-			}
-
-			// Re-send initial prompt to start fresh
-			if (chat && currentTabId && chat.initialPrompt) {
-				const pageData = await capturePageData(currentTabId);
-				await sendMessageToLLM(currentChatId, chat.initialPrompt, pageData);
-			}
 		}
 	};
 
@@ -1679,9 +1716,6 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 		// Clear editing state
 		handleCancelEditMessage();
 
-		// Clear pending approval since we're resending
-		currentChat.pendingApproval = null;
-
 		// Send the edited message to the LLM
 		await sendMessageToLLM(currentChat.id, editingMessageContent.trim());
 	};
@@ -1699,7 +1733,6 @@ ${currentPageData.consoleLog.slice(0, 10000)}`,
 
 		// Truncate chat history to this point (keep messages up to and including this one)
 		currentChat.messages = currentChat.messages.slice(0, messageIndex + 1);
-		currentChat.pendingApproval = null; // Clear pending approval on revert
 		currentChat.updatedAt = Date.now();
 
 		// Restore script snapshot if available
@@ -2362,13 +2395,30 @@ ${el.outerHTML}`;
 											className="flex-1 px-2 py-1 text-sm font-medium bg-white border border-gray-200 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
 											placeholder="Mod name"
 										/>
+										{currentChat.initialPrompt && (
+											<button
+												type="button"
+												onClick={() =>
+													generateModTitle(
+														selectedScript.chatHistoryId,
+														currentChat.initialPrompt,
+														selectedScript.id,
+														true,
+													)
+												}
+												disabled={generatingTitleFor.has(selectedScript.id)}
+												className="p-1 text-gray-400 hover:text-yellow-500 transition-colors disabled:cursor-wait"
+												title="Generate title with AI"
+											>
+												{generatingTitleFor.has(selectedScript.id) ? "…" : "✨"}
+											</button>
+										)}
 									</div>
 									<div className="flex items-center gap-1">
 										<button
 											type="button"
 											onClick={async () => {
 												currentChat.messages = [];
-												currentChat.pendingApproval = null;
 												currentChat.initialPrompt = ""; // Allow re-entering initial prompt
 												currentChat.updatedAt = Date.now();
 												await saveChatHistory(currentChat);
@@ -2403,14 +2453,12 @@ ${el.outerHTML}`;
 									className="w-full px-2 py-1 text-xs font-mono bg-white border border-gray-200 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
 									placeholder="Match URLs (regex)"
 								/>
-								<details className="text-xs" open={!!pendingApproval}>
+								<details className="text-xs" open>
 									<summary className="cursor-pointer text-gray-600 hover:text-gray-800 select-none flex items-center justify-between">
 										<span>
 											{selectedScript.jsScript
-												? `Script (${selectedScript.jsScript.split("\n").length} lines)${pendingApproval ? " - awaiting approval" : ""}`
-												: pendingApproval
-													? "Script (pending approval)"
-													: "No script yet"}
+												? `Script (${selectedScript.jsScript.split("\n").length} lines)`
+												: "No script yet"}
 										</span>
 										{selectedScript.jsScript && (
 											<button
@@ -2495,21 +2543,18 @@ ${el.outerHTML}`;
 														title="Click to expand/collapse"
 													>
 														{expandedSystemPrompt
-															? `You are an AI assistant that helps users create custom JavaScript jsScript to modify web pages. You have two tools available:
+															? `You are an AI assistant that helps users create custom JavaScript userscripts to modify web pages. You have one tool available:
 
-1. execute_js(jsScript: string) - Execute JavaScript jsScript on the current page and see the output. Use this to test changes and explore the page structure.
-2. submit_final_userscript(matchUrls: string, jsScript: string) - Submit the final userscript when ready. matchUrls should be a regex pattern matching the target URLs.
-
-After each execute_js call, ask the user if the changes look correct. If yes, save using submit_final_userscript. If no, continue iterating based on their feedback.`
-															: "You are an AI assistant that helps users create custom JavaScript jsScript to modify web pages..."}
+execute_js(jsScript: string) - Execute JavaScript on the current page. The page will be refreshed and the script will run automatically. The script is saved after each execution, so just keep iterating based on user feedback.`
+															: "You are an AI assistant that helps users create custom JavaScript userscripts to modify web pages..."}
 													</div>
 												</div>
 												<div>
 													<div className="font-medium text-gray-600">
-														Initial URL:
+														URL:
 													</div>
 													<div className="text-gray-800 mt-1 break-all">
-														{currentChat.initialUrl}
+														{currentUrl || currentChat.initialUrl}
 													</div>
 												</div>
 												{currentChat.initialHtml && (
@@ -2655,13 +2700,72 @@ After each execute_js call, ask the user if the changes look correct. If yes, sa
 												</div>
 											)}
 											<div
-												className={`inline-block max-w-[80%] p-3 rounded-lg ${
+												className={`inline-block max-w-[80%] p-3 rounded-lg overflow-hidden ${
 													msg.role === "user"
 														? "bg-blue-500 text-white"
 														: "bg-gray-200 text-gray-800"
 												}`}
 											>
-												<div className="whitespace-pre-wrap">{msg.content}</div>
+												{(() => {
+													// Check if message has grabbed elements to collapse
+													const hasGrabbedElements = msg.grabbedElements && msg.grabbedElements.length > 0;
+													const isExpanded = expandedGrabbedElements.has(msg.id);
+
+													if (hasGrabbedElements && !isExpanded) {
+														// Find where the grabbed elements section starts
+														const elementsSectionMatch = msg.content.match(
+															/\n\n(Here are the elements I selected:|The user has selected the following elements on the page for context:)/
+														);
+														const mainContent = elementsSectionMatch
+															? msg.content.slice(0, elementsSectionMatch.index)
+															: msg.content.split("\n--- Selected Element")[0];
+
+														return (
+															<>
+																<div className="whitespace-pre-wrap break-words">{mainContent}</div>
+																<button
+																	type="button"
+																	onClick={() => setExpandedGrabbedElements(prev => new Set(prev).add(msg.id))}
+																	className="mt-2 flex flex-wrap items-center gap-2 text-left hover:opacity-80 transition-opacity"
+																>
+																	{msg.grabbedElements?.map((el, idx) => (
+																		<div key={el.xpath || idx} className="flex items-center gap-1 bg-white/20 rounded px-1.5 py-0.5">
+																			{el.screenshot && (
+																				<img
+																					src={el.screenshot}
+																					alt={el.tagName}
+																					className="w-6 h-6 object-cover rounded"
+																				/>
+																			)}
+																			<code className="text-xs">&lt;{el.tagName.toLowerCase()}&gt;</code>
+																		</div>
+																	))}
+																	<span className="text-xs opacity-70">click to expand</span>
+																</button>
+															</>
+														);
+													}
+
+													// Expanded or no grabbed elements - show full content with proper wrapping
+													return (
+														<>
+															<div className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{msg.content}</div>
+															{hasGrabbedElements && isExpanded && (
+																<button
+																	type="button"
+																	onClick={() => setExpandedGrabbedElements(prev => {
+																		const next = new Set(prev);
+																		next.delete(msg.id);
+																		return next;
+																	})}
+																	className="mt-2 text-xs opacity-70 hover:opacity-100"
+																>
+																	collapse
+																</button>
+															)}
+														</>
+													);
+												})()}
 												{msg.toolResults && (
 													<div className="mt-2 p-2 bg-black/10 rounded text-xs font-mono">
 														{msg.toolResults
@@ -2693,67 +2797,6 @@ After each execute_js call, ask the user if the changes look correct. If yes, sa
 								</div>
 							))}
 						</div>
-
-						{/* Approval UI */}
-						{pendingApproval && (
-							<div className="border-t border-gray-200 bg-yellow-50 p-4">
-								<div className="text-sm font-medium mb-2">
-									Does this look correct?
-								</div>
-								<div className="text-xs bg-white p-2 rounded mb-3 font-mono max-h-32 overflow-y-auto">
-									{pendingApproval.output.split("\n").map((line, idx) => (
-										<div
-											// biome-ignore lint/suspicious/noArrayIndexKey: diff lines are static
-											key={idx}
-											className={
-												line.startsWith("-") && line.includes("removed")
-													? "text-red-600"
-													: line.startsWith("+") && line.includes("added")
-														? "text-green-600"
-														: "text-gray-500"
-											}
-										>
-											{line}
-										</div>
-									))}
-								</div>
-								<input
-									type="text"
-									value={rejectionFeedback}
-									onChange={(e) => setRejectionFeedback(e.target.value)}
-									placeholder="Optional: describe what's wrong..."
-									className="w-full px-3 py-2 text-sm border border-gray-300 rounded mb-3 focus:outline-none focus:ring-2 focus:ring-orange-500"
-									onKeyPress={(e) => {
-										if (e.key === "Enter") {
-											handleReject("continue");
-										}
-									}}
-								/>
-								<div className="flex gap-2">
-									<button
-										type="button"
-										onClick={handleApprove}
-										className="flex-1 px-3 py-2 text-sm bg-green-500 text-white rounded hover:bg-green-600"
-									>
-										Yes, save it
-									</button>
-									<button
-										type="button"
-										onClick={() => handleReject("continue")}
-										className="flex-1 px-3 py-2 text-sm bg-orange-500 text-white rounded hover:bg-orange-600"
-									>
-										Keep trying
-									</button>
-									<button
-										type="button"
-										onClick={() => handleReject("refresh")}
-										className="flex-1 px-3 py-2 text-sm bg-red-500 text-white rounded hover:bg-red-600"
-									>
-										Start over
-									</button>
-								</div>
-							</div>
-						)}
 
 						{/* Grabbed Elements Display */}
 						{grabbedElements.length > 0 && (
@@ -2834,27 +2877,34 @@ After each execute_js call, ask the user if the changes look correct. If yes, sa
 								</div>
 							)}
 							{/* Status Indicator */}
-							<div className="flex items-center gap-2 mb-2 text-xs">
-								<div
-									className={`w-2 h-2 rounded-full ${
-										status === "IDLE"
-											? "bg-green-500"
+							<div className="flex items-center justify-between gap-2 mb-2 text-xs">
+								<div className="flex items-center gap-2">
+									<div
+										className={`w-2 h-2 rounded-full ${
+											status === "IDLE"
+												? "bg-green-500"
+												: status === "SENDING_TO_LLM"
+													? "bg-yellow-500 animate-pulse"
+													: status === "WAITING_FOR_LLM_RESPONSE"
+														? "bg-blue-500 animate-pulse"
+														: "bg-purple-500 animate-pulse"
+										}`}
+									/>
+									<span className="text-gray-600 font-mono text-[10px]">
+										{status === "IDLE"
+											? "Ready"
 											: status === "SENDING_TO_LLM"
-												? "bg-yellow-500 animate-pulse"
+												? formatSendingStats()
 												: status === "WAITING_FOR_LLM_RESPONSE"
-													? "bg-blue-500 animate-pulse"
-													: "bg-purple-500 animate-pulse"
-									}`}
-								/>
-								<span className="text-gray-600 font-mono">
-									{status === "IDLE"
-										? "Ready"
-										: status === "SENDING_TO_LLM"
-											? `Sending ${textTokensSent.toLocaleString()} tokens${imageSizeKb > 0 ? ` + ${imageSizeKb.toFixed(1)}kb img` : ""}...`
-											: status === "WAITING_FOR_LLM_RESPONSE"
-												? `Thinking... ${elapsedSeconds}s${tokensReceived > 0 ? ` (~${tokensReceived.toLocaleString()} tokens)` : ""}`
-												: "Running JS..."}
-								</span>
+													? `⏳ ${elapsedSeconds}s${tokensReceived > 0 ? `  ⤵ ${tokensReceived.toLocaleString()}` : ""}`
+													: "⚡ Running JS..."}
+									</span>
+								</div>
+								{formatContextStats() && (
+									<span className="text-gray-400 font-mono text-[10px]" title="Total tokens and images in conversation">
+										ctx: {formatContextStats()}
+									</span>
+								)}
 							</div>
 							<div className="flex gap-2">
 								<button

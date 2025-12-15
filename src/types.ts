@@ -50,13 +50,15 @@ export interface ChatMessage {
 	// Snapshot of the userscript state BEFORE this message was sent
 	// Only stored on user messages for revert functionality (reverts to this state)
 	scriptSnapshot?: UserscriptSnapshot;
+	// Grabbed elements included with this message (for displaying thumbnails)
+	grabbedElements?: GrabbedElement[];
 }
 
 export interface ToolCall {
 	id: string;
 	type: "function";
 	function: {
-		name: "execute_js" | "submit_final_userscript";
+		name: "execute_js";
 		arguments: string; // JSON string
 	};
 }
@@ -77,11 +79,6 @@ export interface ChatHistory {
 	initialConsoleLog: string;
 	createdAt: number;
 	updatedAt: number;
-	// Pending approval state - persisted per-chat so it survives tab changes/refreshes
-	pendingApproval?: {
-		jsScript: string;
-		output: string;
-	} | null;
 }
 
 export interface ExecuteJsRequest {

@@ -2,6 +2,8 @@
 
 A Chrome extension that lets you create custom mods and patches for any live website using AI assistance.
 
+https://chromewebstore.google.com/detail/improv-ai-userscript-crea/fjegfnolfbbhbekpchkdccpmanjemjbh
+
 Can be combined with Browserbase/Stagehand to modify sites to make them easier to automate with AI, or to create repeatable actions triggered by custom buttons added to the site.
 
 
